@@ -7,6 +7,7 @@ mod connection;
 pub mod dns_control;
 mod dns_listener;
 pub mod drain;
+mod inbound;
 pub mod janitor;
 #[cfg(feature = "ebpf")]
 pub(crate) mod nfqueue;

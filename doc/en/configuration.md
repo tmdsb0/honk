@@ -14,6 +14,7 @@ honk uses a dialect of dae configuration syntax; the [dialect reference](./refer
 | `subscription` | Fetch remote node lists. | [Subscription reference](./reference/subscription.md) |
 | `assets` | Set download defaults for geodata, the external UI, and subscriptions. | [Assets reference](./reference/assets.md) |
 | `experimental` | Enable the independent native API, Clash API, or persistent cache. | [Experimental reference](./reference/experimental.md) |
+| `listeners` | Bind local mixed (HTTP + SOCKS5) inbound ports, each pinned to one outbound. | [Listeners reference](./reference/listeners.md) |
 | CLI | Select a config, backend, object file, or local command. | [CLI reference](./reference/cli.md) |
 
 honk injects the built-in outbounds `direct` and `block` at startup. Use them in groups and routing rules.

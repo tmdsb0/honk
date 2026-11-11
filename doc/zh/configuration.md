@@ -14,6 +14,7 @@ honk 使用 dae 配置语法的方言；与 dae 的已知差异见[方言参考]
 | `subscription` | 获取远程节点列表。 | [订阅参考](./reference/subscription.md) |
 | `assets` | 为 geodata、外部 UI 和订阅设置下载默认值。 | [Assets 参考](./reference/assets.md) |
 | `experimental` | 启用独立原生 API、Clash API 或持久化缓存。 | [Experimental 参考](./reference/experimental.md) |
+| `listeners` | 绑定本地 mixed（HTTP + SOCKS5）入站端口，每个端口固定一个出站。 | [监听器参考](./reference/listeners.md) |
 | CLI | 选择配置、后端、目标文件或本地命令。 | [CLI 参考](./reference/cli.md) |
 
 内置出站 `direct` 与 `block` 会在启动时注入，可用于组和路由规则。

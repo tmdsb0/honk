@@ -13,6 +13,7 @@ pub mod dns;
 pub mod error;
 pub mod experimental;
 pub mod group;
+pub mod listener;
 pub mod node;
 pub mod options;
 pub mod parser;
@@ -25,6 +26,7 @@ pub mod types;
 pub use config::Config;
 pub use diagnostic::ConfigDiagnostic;
 pub use error::ConfigError;
+pub use listener::{ListenerConfig, ListenerType};
 
 #[cfg(feature = "conformance")]
 pub use parser::conformance;

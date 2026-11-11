@@ -89,6 +89,9 @@ pub(crate) fn restart_required_changes(
     if dns_bind_changed {
         changed.push(field!("dns.bind"));
     }
+    if current.listeners != candidate.listeners {
+        changed.push(field!("listeners"));
+    }
     let old_global = &current.global;
     let new_global = &candidate.global;
     if old_global.check_interval_secs != new_global.check_interval_secs {
@@ -233,6 +236,22 @@ fn udp_probe_input_changed(current: &[String], candidate: &[String]) -> bool {
 #[cfg(test)]
 mod syslog_tests {
     use super::*;
+
+    #[test]
+    fn listeners_require_restart() {
+        let current = Config::default();
+        let mut candidate = current.clone();
+        candidate.listeners.push(honk_config::ListenerConfig {
+            name: "mixed0".into(),
+            listener_type: Default::default(),
+            listen: "127.0.0.1".parse().unwrap(),
+            port: 12000,
+            proxy: None,
+        });
+        let changed = restart_required_changes(&current, &candidate, None, None);
+        let paths: Vec<_> = changed.iter().map(|field| field.path).collect();
+        assert_eq!(paths, ["listeners"]);
+    }
 
     #[test]
     fn dns_syslog_settings_require_restart() {

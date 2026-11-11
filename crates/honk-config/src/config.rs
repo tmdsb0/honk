@@ -19,6 +19,7 @@ use crate::ConfigDiagnostic;
 use crate::dns::DnsConfig;
 use crate::experimental::ExperimentalConfig;
 use crate::group::Group;
+use crate::listener::ListenerConfig;
 use crate::node::Node;
 use crate::routing::RoutingConfig;
 use crate::subscription::Subscription;
@@ -54,6 +55,9 @@ pub struct Config {
     pub experimental: ExperimentalConfig,
     #[serde(default)]
     pub assets: crate::assets::AssetsConfig,
+    /// Mixed (HTTP + SOCKS5) inbound listeners. Empty by default.
+    #[serde(default)]
+    pub listeners: Vec<ListenerConfig>,
 }
 
 /// Global configuration matching dae `global { ... }` section.
@@ -1116,6 +1120,68 @@ impl Config {
                         .field("download_detour"),
                     "invalid-subscription-detour-target",
                     "subscription download detour must be direct, routing or a group",
+                ));
+            }
+        }
+        self.validate_listeners_detailed(source)
+    }
+
+    /// Listener checks: names are unique (exact match), no two listeners
+    /// share a `(listen, port)` pair, ports are nonzero, and a pinned
+    /// `proxy` names a node, a group, `direct`, or `block`. Unicode names
+    /// are compared verbatim, never normalized or folded.
+    fn validate_listeners_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
+        for (index, listener) in self.listeners.iter().enumerate() {
+            let setting =
+                |field: &'static str| SettingPath::new("listeners").index(index + 1).field(field);
+            if listener.name.is_empty() {
+                return Err(config_validation_error(
+                    source,
+                    setting("name"),
+                    "invalid-config-value",
+                    "listener name must not be empty",
+                ));
+            }
+            if listener.port == 0 {
+                return Err(config_validation_error(
+                    source,
+                    setting("port"),
+                    "invalid-config-value",
+                    "listener port must be between 1 and 65535",
+                ));
+            }
+            if self.listeners[..index]
+                .iter()
+                .any(|other| other.name == listener.name)
+            {
+                return Err(config_validation_error(
+                    source,
+                    setting("name"),
+                    "duplicate-listener-name",
+                    "duplicate listener name",
+                ));
+            }
+            if self.listeners[..index]
+                .iter()
+                .any(|other| other.listen == listener.listen && other.port == listener.port)
+            {
+                return Err(config_validation_error(
+                    source,
+                    setting("port"),
+                    "duplicate-listener-address",
+                    "duplicate listener listen address and port",
+                ));
+            }
+            if let Some(proxy) = listener.proxy.as_deref().filter(|proxy| !proxy.is_empty())
+                && !matches!(proxy, Self::BUILTIN_DIRECT_NODE | Self::BUILTIN_BLOCK_NODE)
+                && !self.nodes.iter().any(|node| node.name == proxy)
+                && !self.groups.iter().any(|group| group.name == proxy)
+            {
+                return Err(config_validation_error(
+                    source,
+                    setting("proxy"),
+                    "unknown-listener-proxy",
+                    "listener proxy is not a declared node, group, direct, or block",
                 ));
             }
         }

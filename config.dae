@@ -141,6 +141,29 @@ group {
     }
 }
 
+# 入站监听（mixed = HTTP + SOCKS5，TCP only，无认证；一个端口绑定一个出口）
+# proxy 须为节点名、组名、direct 或 block；留空则走全局 routing。
+# 注意：不要把端口指向 score/urltest/loadbalance 组——出口 IP 会在会话中途切换；
+# 每个端口应固定到单个节点，或固定到 policy: fixed(0) 的 Selector 组。
+# listeners {
+#     mixed0 {
+#         type: mixed
+#         listen: 0.0.0.0
+#         port: 12000
+#         proxy: '菲律宾-1'
+#     }
+#     mixed1 {
+#         type: mixed
+#         port: 13000
+#         proxy: '🇵🇭 菲律宾-2'
+#     }
+#     mixed2 {
+#         type: mixed
+#         port: 12001
+#         proxy: '🇻🇳 越南'
+#     }
+# }
+
 # 路由规则
 # 参考: https://github.com/daeuniverse/dae/blob/main/docs/routing.md
 routing {
