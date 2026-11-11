@@ -1,4 +1,5 @@
 use super::*;
+use std::net::IpAddr;
 
 pub(super) struct TcpDialWinner {
     pub(super) stream: crate::proxy::ProxyStream,
@@ -745,5 +746,150 @@ impl ControlPlaneHandle {
             }
         };
         scope.scope(dial).await
+    }
+}
+
+impl ControlPlaneHandle {
+    /// Dial a target requested by an inbound (mixed) listener connection.
+    ///
+    /// Skips the transparent path entirely: no `SO_ORIGINAL_DST` handoff, no
+    /// sniffing, no kernel routing generation. The target is already known
+    /// (SOCKS5 CONNECT address, HTTP CONNECT authority, plain-HTTP Host).
+    ///
+    /// Resolution, in order:
+    /// 1. A domain target is resolved through the DNS controller; IPv4 is
+    ///    preferred.
+    /// 2. A forced proxy (`listeners.<name>.proxy`) resolves to one leaf:
+    ///    the `direct`/`block` builtins, a bare node name, or one node
+    ///    selected from a group for this target. Unknown names fail; they
+    ///    never silently fall back to direct.
+    /// 3. Without a forced proxy, a [`ConnectionInfo`] is built from the
+    ///    parsed target and the caller IP and passed to
+    ///    [`Router::route_action`]; the routed outbound resolves as in (2).
+    ///
+    /// The dial itself goes through [`Self::dial_pooled`], so proxy-server
+    /// connects use `connect_outbound` (bypass mark) and direct dials use the
+    /// global bypass mark or the routed rule mark, exactly like transparent
+    /// flows. Callers relay the returned stream with
+    /// [`crate::relay::relay_proxy`].
+    pub(in crate::control) async fn dial_for_inbound(
+        &self,
+        target: InboundTarget,
+        target_port: u16,
+        forced_proxy: Option<&str>,
+        src_ip: IpAddr,
+    ) -> Result<InboundDial, InboundDialError> {
+        let (target_ip, target_domain) = match &target {
+            InboundTarget::Ip(ip) => (*ip, None),
+            InboundTarget::Domain(domain) => {
+                let resolved = self.dns_controller.resolve_domain(domain).await?;
+                let target_ip = resolved
+                    .iter()
+                    .copied()
+                    .find(|ip| ip.is_ipv4())
+                    .or_else(|| resolved.first().copied())
+                    .ok_or_else(|| {
+                        InboundDialError::Failed(anyhow::anyhow!(
+                            "DNS resolution for '{domain}' returned no address"
+                        ))
+                    })?;
+                (target_ip, Some(domain.clone()))
+            }
+        };
+        let target_addr = SocketAddr::new(target_ip, target_port);
+        let ipver = if target_ip.is_ipv6() {
+            IpVersion::V6
+        } else {
+            IpVersion::V4
+        };
+        let config = self.config.read().await;
+        let group_manager = self.group_manager.read().clone();
+        let (node, outbound_name, direct_mark) = match forced_proxy {
+            Some(name) => {
+                let node = resolve_inbound_node(&config, &group_manager, name, ipver)?;
+                if node.protocol() == NodeProtocol::Block {
+                    return Err(InboundDialError::Blocked(name.to_owned()));
+                }
+                (node, name.to_owned(), None)
+            }
+            None => {
+                let conn = ConnectionInfo {
+                    domain: target_domain.clone(),
+                    dst_ip: target_ip,
+                    dst_port: target_port,
+                    src_ip,
+                    src_port: 0,
+                    protocol: "tcp",
+                    process_name: None,
+                    mac: None,
+                    dscp: None,
+                };
+                let router = self.router.read().await;
+                let (action, _) = router.route_action(&conn);
+                let outbound_name = action.outbound.clone();
+                let mark = action.mark;
+                if outbound_name == "block" {
+                    return Err(InboundDialError::Blocked(outbound_name));
+                }
+                let node = resolve_inbound_node(&config, &group_manager, &outbound_name, ipver)?;
+                if node.protocol() == NodeProtocol::Block {
+                    return Err(InboundDialError::Blocked(outbound_name));
+                }
+                (node, outbound_name, mark)
+            }
+        };
+        let connect_timeout = Duration::from_millis(config.global.connect_timeout_ms);
+        drop(config);
+        // Domain targets are meaningful only for proxy outbounds; direct
+        // always dials the resolved IP.
+        let dial_domain = if outbound_name == "direct" {
+            None
+        } else {
+            target_domain.as_deref()
+        };
+        let generation = self.runtime_registry.read().clone();
+        let scope = generation.dial_scope(|| {});
+        let (stream, _fresh) = Self::dial_pooled(
+            &self.proxy_registry,
+            &self.connection_pool,
+            &generation,
+            &node,
+            (target_addr, dial_domain),
+            connect_timeout,
+            direct_mark,
+            &scope,
+        )
+        .await
+        .map_err(InboundDialError::Failed)?;
+        Ok(InboundDial {
+            stream,
+            target: target_addr,
+            outbound: outbound_name,
+        })
+    }
+}
+
+/// Resolve a listener `proxy:` value (or a routed outbound name) to one node.
+/// A group contributes a single leaf selected for this target; a bare node
+/// name resolves directly, which is safe here because the dial is
+/// userspace-only (unlike eBPF routing, it needs no outbound id).
+fn resolve_inbound_node(
+    _config: &Config,
+    groups: &GroupManager,
+    name: &str,
+    ipver: IpVersion,
+) -> anyhow::Result<Node> {
+    match name {
+        "direct" => Ok(Config::builtin_direct_node()),
+        "block" => Ok(Config::builtin_block_node()),
+        _ => {
+            if let Some(node) = groups.node_by_name(name) {
+                return Ok(node.clone());
+            }
+            if let Some(node) = groups.select_node_for_domain(name, ProbeDomain::Tcp, ipver) {
+                return Ok(node.clone());
+            }
+            anyhow::bail!("unknown listener proxy '{name}'")
+        }
     }
 }

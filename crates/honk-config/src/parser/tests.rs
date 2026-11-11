@@ -3426,3 +3426,187 @@ mod assets_block {
         }
     }
 }
+
+#[cfg(test)]
+mod listeners {
+    use crate::ListenerType;
+    use crate::parser::{parse_dae_config, parse_dae_config_with_detailed_diagnostics};
+
+    /// The three nodes the example listeners pin to.
+    const NODES: &str = r#"
+node {
+    '菲律宾-1': 'socks5://127.0.0.1:1080'
+    '🇵🇭 菲律宾-2': 'socks5://127.0.0.1:1081'
+    '🇻🇳 越南': 'socks5://127.0.0.1:1082'
+}
+"#;
+
+    const EXAMPLE_LISTENERS: &str = r#"
+listeners {
+    mixed0 {
+        type: mixed
+        listen: 0.0.0.0
+        port: 12000
+        proxy: '菲律宾-1'
+    }
+    mixed1 {
+        type: mixed
+        port: 13000
+        proxy: '🇵🇭 菲律宾-2'
+    }
+    mixed2 {
+        type: mixed
+        port: 12001
+        proxy: '🇻🇳 越南'
+    }
+}
+"#;
+
+    #[test]
+    fn parses_user_example_listeners_verbatim() {
+        let input = format!("{NODES}{EXAMPLE_LISTENERS}");
+        let config = parse_dae_config(&input).unwrap();
+        assert_eq!(config.listeners.len(), 3);
+
+        let mixed0 = &config.listeners[0];
+        assert_eq!(mixed0.name, "mixed0");
+        assert_eq!(mixed0.listener_type, ListenerType::Mixed);
+        assert_eq!(
+            mixed0.listen,
+            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(mixed0.port, 12000);
+        assert_eq!(mixed0.proxy.as_deref(), Some("菲律宾-1"));
+
+        let mixed1 = &config.listeners[1];
+        assert_eq!(mixed1.name, "mixed1");
+        assert_eq!(mixed1.listener_type, ListenerType::Mixed);
+        // listen defaults to loopback when omitted.
+        assert_eq!(
+            mixed1.listen,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(mixed1.port, 13000);
+        assert_eq!(mixed1.proxy.as_deref(), Some("🇵🇭 菲律宾-2"));
+
+        let mixed2 = &config.listeners[2];
+        assert_eq!(mixed2.name, "mixed2");
+        assert_eq!(mixed2.port, 12001);
+        assert_eq!(mixed2.proxy.as_deref(), Some("🇻🇳 越南"));
+
+        config.validate_detailed().unwrap();
+    }
+
+    #[test]
+    fn listener_type_and_listen_default_when_omitted() {
+        let config = parse_dae_config(
+            "listeners {\n    only {\n        port: 12000\n        proxy: direct\n    }\n}",
+        )
+        .unwrap();
+        assert_eq!(config.listeners.len(), 1);
+        assert_eq!(config.listeners[0].listener_type, ListenerType::Mixed);
+        assert_eq!(
+            config.listeners[0].listen,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(config.listeners[0].proxy.as_deref(), Some("direct"));
+        config.validate_detailed().unwrap();
+    }
+
+    #[test]
+    fn duplicate_listener_name_rejected() {
+        let config = parse_dae_config(
+            "listeners {\n    dup {\n        port: 12000\n    }\n    dup {\n        port: 12001\n    }\n}",
+        )
+        .unwrap();
+        let error = config.validate_detailed().unwrap_err();
+        assert_eq!(error.diagnostic.code, "duplicate-listener-name");
+        assert_eq!(error.diagnostic.setting.to_string(), "listeners[2].name");
+    }
+
+    #[test]
+    fn duplicate_listener_address_rejected_but_other_listen_ok() {
+        let config = parse_dae_config(
+            "listeners {\n    a {\n        listen: 0.0.0.0\n        port: 12000\n    }\n    b {\n        listen: 0.0.0.0\n        port: 12000\n    }\n}",
+        )
+        .unwrap();
+        let error = config.validate_detailed().unwrap_err();
+        assert_eq!(error.diagnostic.code, "duplicate-listener-address");
+        assert_eq!(error.diagnostic.setting.to_string(), "listeners[2].port");
+
+        // Same port on a different listen address is a different socket.
+        let config = parse_dae_config(
+            "listeners {\n    a {\n        listen: 127.0.0.1\n        port: 12000\n    }\n    b {\n        listen: 0.0.0.0\n        port: 12000\n    }\n}",
+        )
+        .unwrap();
+        config.validate_detailed().unwrap();
+    }
+
+    #[test]
+    fn unknown_listener_proxy_rejected() {
+        let config = parse_dae_config(
+            "listeners {\n    bad {\n        port: 12000\n        proxy: 'no-such-node'\n    }\n}",
+        )
+        .unwrap();
+        let error = config.validate_detailed().unwrap_err();
+        assert_eq!(error.diagnostic.code, "unknown-listener-proxy");
+        assert_eq!(error.diagnostic.setting.to_string(), "listeners[1].proxy");
+    }
+
+    #[test]
+    fn invalid_listener_type_rejected() {
+        let error = parse_dae_config_with_detailed_diagnostics(
+            "listeners {\n    bad {\n        type: socks\n        port: 12000\n    }\n}",
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-config-value");
+        assert_eq!(error.diagnostic.setting.to_string(), "listeners[1].type");
+    }
+
+    #[test]
+    fn port_zero_rejected() {
+        let error = parse_dae_config_with_detailed_diagnostics(
+            "listeners {\n    bad {\n        port: 0\n    }\n}",
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-config-value");
+        assert_eq!(error.diagnostic.setting.to_string(), "listeners[1].port");
+    }
+
+    #[test]
+    fn missing_port_rejected() {
+        let error = parse_dae_config_with_detailed_diagnostics(
+            "listeners {\n    bad {\n        proxy: direct\n    }\n}",
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-config-value");
+        assert_eq!(error.diagnostic.setting.to_string(), "listeners[1].port");
+    }
+
+    #[test]
+    fn serde_path_accepts_listeners_with_defaults() {
+        let config = crate::Config::from_json_str(
+            r#"{"listeners": [{"name": "mixed0", "port": 12000, "proxy": "block"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.listeners.len(), 1);
+        assert_eq!(config.listeners[0].listener_type, ListenerType::Mixed);
+        assert_eq!(
+            config.listeners[0].listen,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(config.listeners[0].proxy.as_deref(), Some("block"));
+        config.validate_detailed().unwrap();
+
+        // Unknown `type` values fail on the serde path too.
+        assert!(
+            crate::Config::from_json_str(
+                r#"{"listeners": [{"name": "bad", "type": "socks", "port": 12000}]}"#
+            )
+            .is_err()
+        );
+    }
+}

@@ -50,3 +50,31 @@ mod routing;
 
 #[cfg(test)]
 pub(in crate::control) use routing::{RealityOutcome, domain_reality_outcome};
+
+/// Target requested by an inbound listener connection, already parsed by the
+/// SOCKS5/HTTP handler: an IP literal, or a domain name the dial must
+/// resolve. No sniffing is involved: the client stated the target.
+#[derive(Debug, Clone)]
+pub(in crate::control) enum InboundTarget {
+    Ip(std::net::IpAddr),
+    Domain(String),
+}
+
+/// A dialed upstream for an inbound connection, ready to relay.
+pub(in crate::control) struct InboundDial {
+    pub(in crate::control) stream: crate::proxy::ProxyStream,
+    pub(in crate::control) target: std::net::SocketAddr,
+    /// Outbound name for stats/accounting: the forced proxy, or the routed
+    /// outbound when the listener falls back to global routing.
+    pub(in crate::control) outbound: String,
+}
+
+/// Dial failure modes a protocol handler must distinguish: a policy refusal
+/// gets a protocol refusal reply, anything else a generic dial-failure reply.
+#[derive(Debug, thiserror::Error)]
+pub(in crate::control) enum InboundDialError {
+    #[error("connection blocked by outbound '{0}'")]
+    Blocked(String),
+    #[error(transparent)]
+    Failed(#[from] anyhow::Error),
+}
