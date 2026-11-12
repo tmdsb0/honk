@@ -55,6 +55,8 @@ pub(crate) fn rebase_subscription_nodes(
         if let Some(mut nodes) = candidate_subscription_nodes.remove(&candidate_id) {
             for node in &mut nodes {
                 node.subscription_id = Some(subscription.id);
+                // Provenance participates in the derived ID; keep it canonical.
+                node.id = node.derive_id();
             }
             static_nodes.extend(nodes);
         }
@@ -476,6 +478,18 @@ impl ControlPlane {
                 }
             };
         new_group_manager.bind_transport_quality(&new_runtime_registry);
+        super::super::node_detour::bind_node_detours(
+            &new_runtime_registry,
+            &new_config.nodes,
+            &self.proxy_registry,
+            &new_config.groups,
+            &new_group_manager,
+        );
+        // Detours and tunnels both belong to a generation. A reused runtime
+        // still holds tunnels opened over the previous generation's paths;
+        // reclaim the ones no flow is holding so their TUN devices do not
+        // outlive the config that created them.
+        new_runtime_registry.prune_masque_tunnels().await;
         let Some(dns_router) = super::dns::reuse_or_build_dns_router(
             &current_config,
             &new_config,

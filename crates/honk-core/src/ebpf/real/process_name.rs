@@ -53,7 +53,13 @@ fn probe_pair(
         .override_global("MM_ARG_START_OFFSET", &mm_arg_start_offset, true);
     let mut bpf = match loader.load(obj) {
         Ok(bpf) => bpf,
-        Err(_) => return false,
+        Err(error) => {
+            tracing::warn!(
+                error = %format_args!("{error:#}"),
+                "argv[0] capture probe could not load the eBPF object; using thread comm"
+            );
+            return false;
+        }
     };
     let sock_ok = bpf
         .program_mut(sock_name)

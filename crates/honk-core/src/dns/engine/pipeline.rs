@@ -16,25 +16,20 @@ mod flight {
 
     use super::{CacheAccess, ExecutionContext, cache};
     use crate::dns::forwarder::DnsForwardError;
-    use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus};
-    use crate::dns::singleflight::{FlightAnswer, FlightLeader};
+    use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance};
+    use crate::dns::response::ResponseTemplate;
+    use crate::dns::singleflight::FlightLeader;
 
     pub(super) fn publish_outcome(leader: FlightLeader, outcome: DnsOutcome) -> DnsOutcome {
         if let Some(template) = outcome.template() {
-            leader.publish(|| {
-                Ok(Arc::new(FlightAnswer {
-                    template: template.clone(),
-                    provenance: outcome.provenance(),
-                    final_upstream: outcome.final_upstream().map(Into::into),
-                }))
-            });
+            leader.publish(Ok(Arc::new(template.clone())));
         }
         outcome
     }
 
     pub(super) async fn waiter_outcome(
         context: &ExecutionContext<'_>,
-        answer: Arc<FlightAnswer>,
+        template: Arc<ResponseTemplate>,
     ) -> Result<DnsOutcome, DnsForwardError> {
         if context.options.cache == CacheAccess::Normal
             && let Some(outcome) = cache::lookup(context, false).await?
@@ -44,13 +39,13 @@ mod flight {
         context.forwarder.outcome_from_wire(
             context.engine,
             context.prepared,
-            answer.template.wire(),
+            template.wire(),
             None,
             OutcomeStatus::Accepted,
-            answer.provenance,
+            Provenance::Upstream,
             EffectiveExpiry::do_not_cache(),
             None,
-            answer.final_upstream.clone(),
+            None,
             Vec::new(),
             context.mode,
         )

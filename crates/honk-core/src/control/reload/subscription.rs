@@ -57,17 +57,20 @@ impl ControlPlane {
         mut diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
         drain: &DrainTracker,
     ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
+        // Stamp provenance before validation: the node ID derives from it, so
+        // assigning it afterwards would leave a non-canonical ID behind.
+        for node in &mut nodes {
+            if node.subscription_id.is_none() {
+                node.subscription_id = Some(subscription_id);
+                node.id = node.derive_id();
+            }
+        }
         honk_config::node::validate_node_collection(&nodes)?;
         if let Some(index) = nodes.iter().position(|node| {
             node.subscription_id
                 .is_some_and(|provider| provider != subscription_id)
         }) {
             return Err(subscription_provenance_error(index));
-        }
-        for node in &mut nodes {
-            if node.subscription_id.is_none() {
-                node.subscription_id = Some(subscription_id);
-            }
         }
         let config_guard = self.config.read().await;
         let current = Arc::clone(&config_guard);
@@ -174,6 +177,7 @@ impl ControlPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use honk_config::node::Group;
 
     fn subscription_node(subscription_id: uuid::Uuid) -> Node {
         let mut node = Node {
@@ -239,5 +243,60 @@ mod tests {
             subscription_id,
             &mut [first]
         ));
+    }
+
+    /// A subscription's `dialer-proxy` may name a group, and the bind resolves
+    /// a group on each dial to whichever member it then picks. Nothing about
+    /// the merge is allowed to take that name away.
+    #[test]
+    fn a_subscription_detour_naming_a_group_survives_the_merge() {
+        let subscription_id = uuid::Uuid::new_v4();
+        let mut node = subscription_node(subscription_id);
+        node.detour = Some("front".into());
+        node.id = node.derive_id();
+        let mut current = Config::default();
+        current.groups.push(Group {
+            name: "front".into(),
+            ..Default::default()
+        });
+
+        let merged = config_with_subscription_nodes(&current, subscription_id, vec![node]);
+
+        assert_eq!(
+            merged.nodes[0].detour_name(),
+            Some("front"),
+            "a group is a detour the bind can resolve, so it must reach it"
+        );
+    }
+
+    /// Settling away a group name is a repair, not a purge: a detour naming a
+    /// node is the whole point, so the merge must leave it exactly as written.
+    #[test]
+    fn a_subscription_detour_naming_a_node_survives_the_merge() {
+        let subscription_id = uuid::Uuid::new_v4();
+        let mut front = subscription_node(subscription_id);
+        front.name = "front".into();
+        front.id = front.derive_id();
+        let mut rider = subscription_node(subscription_id);
+        rider.name = "rider".into();
+        // The identity is content-derived, so a second hop needs a server of
+        // its own or it is simply the same node again.
+        rider.address = "127.0.0.1:1081".into();
+        rider.detour = Some("front".into());
+        rider.id = rider.derive_id();
+
+        let merged =
+            config_with_subscription_nodes(&Config::default(), subscription_id, vec![front, rider]);
+
+        let rider = merged
+            .nodes
+            .iter()
+            .find(|node| node.name == "rider")
+            .expect("the chained node must merge");
+        assert_eq!(
+            rider.detour_name(),
+            Some("front"),
+            "a node detour is what the merge exists to keep"
+        );
     }
 }

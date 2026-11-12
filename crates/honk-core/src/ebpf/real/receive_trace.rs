@@ -8,6 +8,7 @@ use anyhow::Context as _;
 use aya::maps::{HashMap, IterableMap, Map, MapData};
 use aya::programs::{FEntry, FExit, fentry::FEntryLink, fexit::FExitLink};
 use aya::{Btf, Ebpf, EbpfLoader};
+use aya_obj::btf::BtfKind;
 use honk_ebpf_common::receive_trace::{
     RECEIVE_TRACE_BATCH_SIZE, RECEIVE_TRACE_VALID, ReceiveTraceBatch, ReceiveTracePacket,
 };
@@ -56,6 +57,93 @@ pub struct ReceiveTrace {
 fn handle(map: &MapData) -> io::Result<HashMap<MapData, u64, ReceiveTraceBatch>> {
     let map = MapData::from_fd(map.fd().as_fd().try_clone_to_owned()?).map_err(io::Error::other)?;
     HashMap::try_from(Map::HashMap(map)).map_err(io::Error::other)
+}
+
+/// fentry targets are kernel-internal symbols, not uapi: a newer kernel may
+/// rename or inline them. Resolve every target against the running BTF before
+/// loading any program, and let an operator point at renamed symbols with a
+/// comma-separated list in the environment instead of rebuilding honk.
+const CANDIDATE_TARGETS: [&str; 1] = ["__skb_recv_udp"];
+const IPV4_TARGETS: [&str; 1] = ["udp_recvmsg"];
+const IPV6_TARGETS: [&str; 1] = ["udpv6_recvmsg"];
+const CANDIDATE_TARGET_ENV: &str = "HONK_UDP_CANDIDATE_FEXIT";
+const IPV4_TARGET_ENV: &str = "HONK_UDP_RECVMSG_V4";
+const IPV6_TARGET_ENV: &str = "HONK_UDP_RECVMSG_V6";
+
+/// Raised only before any program is loaded. The control plane may retry such
+/// a failure; once Aya has loaded a program it cannot be loaded again.
+#[derive(Debug)]
+pub(crate) struct TargetsUnavailable {
+    pub(crate) role: &'static str,
+    pub(crate) tried: String,
+}
+
+impl std::fmt::Display for TargetsUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no {} fentry target in kernel BTF (tried: {}); set the matching HONK_UDP_* environment variable if this kernel renamed it",
+            self.role, self.tried
+        )
+    }
+}
+
+impl std::error::Error for TargetsUnavailable {}
+
+fn candidate_names(env: &str, defaults: &[&str]) -> Vec<String> {
+    std::env::var(env)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|names| !names.is_empty())
+        .unwrap_or_else(|| defaults.iter().map(|name| (*name).to_owned()).collect())
+}
+
+/// First candidate that exists as a `BTF_KIND_FUNC`; Aya's `load()` resolves
+/// the target with exactly this lookup, so a miss here is a guaranteed failure.
+fn resolve_target(btf: &Btf, role: &'static str, env: &str, defaults: &[&str]) -> Option<String> {
+    let names = candidate_names(env, defaults);
+    for name in &names {
+        if btf.id_by_type_name_kind(name, BtfKind::Func).is_ok() {
+            return Some(name.clone());
+        }
+    }
+    tracing::warn!(
+        role,
+        tried = %names.join(", "),
+        "UDP receive trace target absent from kernel BTF"
+    );
+    None
+}
+
+struct Targets {
+    candidate: String,
+    ipv4: Option<String>,
+    ipv6: Option<String>,
+}
+
+impl Targets {
+    fn resolve(btf: &Btf) -> anyhow::Result<Self> {
+        let tried = candidate_names(CANDIDATE_TARGET_ENV, &CANDIDATE_TARGETS).join(", ");
+        let candidate = resolve_target(btf, "candidate", CANDIDATE_TARGET_ENV, &CANDIDATE_TARGETS)
+            .ok_or_else(|| {
+                anyhow::Error::new(TargetsUnavailable {
+                    role: "candidate",
+                    tried,
+                })
+            })?;
+        Ok(Self {
+            candidate,
+            ipv4: resolve_target(btf, "ipv4", IPV4_TARGET_ENV, &IPV4_TARGETS),
+            ipv6: resolve_target(btf, "ipv6", IPV6_TARGET_ENV, &IPV6_TARGETS),
+        })
+    }
 }
 
 fn attach_exit(bpf: &mut Ebpf, btf: &Btf, name: &str, target: &str) -> anyhow::Result<FExitLink> {
@@ -112,32 +200,43 @@ impl ReceiveTrace {
     #[cfg(test)]
     pub(crate) fn load_for_test() -> anyhow::Result<(Ebpf, Arc<Self>)> {
         let (mut bpf, _, kernel_btf) = Self::load_unattached_for_test()?;
-        let map = bpf.take_map("RECEIVE_TRACE");
-        let trace = Self::attach(&mut bpf, &kernel_btf, map.as_ref())?;
+        let trace = Self::attach(&mut bpf, &kernel_btf)?;
         Ok((bpf, trace))
     }
 
-    pub(super) fn attach(
-        bpf: &mut Ebpf,
-        btf: &Btf,
-        map: Option<&Map>,
-    ) -> anyhow::Result<Arc<Self>> {
+    pub(super) fn attach(bpf: &mut Ebpf, btf: &Btf) -> anyhow::Result<Arc<Self>> {
+        // Resolve all three fentry targets before loading anything. A renamed
+        // symbol on a newer kernel must not surface as an opaque verifier
+        // error, and a partially loaded Aya program cannot be loaded again.
+        let targets = Targets::resolve(btf)?;
+        tracing::info!(
+            candidate = %targets.candidate,
+            ipv4 = ?targets.ipv4,
+            ipv6 = ?targets.ipv6,
+            "UDP receive trace fentry targets resolved from kernel BTF"
+        );
         // Both recvmsg paths consume the candidate from this shared helper.
-        let candidate = attach_exit(bpf, btf, "honk_udp_receive_candidate", "__skb_recv_udp")?;
-        let ipv4 = attach_family(
-            bpf,
-            btf,
-            "honk_udp_receive_enter",
-            "honk_udp_receive_exit",
-            "udp_recvmsg",
-        );
-        let ipv6 = attach_family(
-            bpf,
-            btf,
-            "honk_udp6_receive_enter",
-            "honk_udp6_receive_exit",
-            "udpv6_recvmsg",
-        );
+        let candidate = attach_exit(bpf, btf, "honk_udp_receive_candidate", &targets.candidate)?;
+        let ipv4 = match &targets.ipv4 {
+            Some(target) => attach_family(
+                bpf,
+                btf,
+                "honk_udp_receive_enter",
+                "honk_udp_receive_exit",
+                target,
+            ),
+            None => Err(anyhow::anyhow!("no IPv4 UDP recvmsg target in kernel BTF")),
+        };
+        let ipv6 = match &targets.ipv6 {
+            Some(target) => attach_family(
+                bpf,
+                btf,
+                "honk_udp6_receive_enter",
+                "honk_udp6_receive_exit",
+                target,
+            ),
+            None => Err(anyhow::anyhow!("no IPv6 UDP recvmsg target in kernel BTF")),
+        };
         if let (Err(ipv4), Err(ipv6)) = (&ipv4, &ipv6) {
             anyhow::bail!("UDP receive hooks unavailable: IPv4: {ipv4:#}; IPv6: {ipv6:#}");
         }
@@ -150,7 +249,7 @@ impl ReceiveTrace {
                 );
             }
         }
-        let Some(Map::HashMap(map)) = map else {
+        let Some(Map::HashMap(map)) = bpf.map("RECEIVE_TRACE") else {
             anyhow::bail!("missing RECEIVE_TRACE hash map");
         };
         Ok(Arc::new(Self {
@@ -327,8 +426,7 @@ mod tests {
                     missing_btf = without_target(data, target)?;
                     &missing_btf
                 };
-                let map = bpf.take_map("RECEIVE_TRACE");
-                let trace = ReceiveTrace::attach(&mut bpf, attach_btf, map.as_ref())
+                let trace = ReceiveTrace::attach(&mut bpf, attach_btf)
                     .expect("one family must survive a sibling hook failure");
                 if fail_exit {
                     let failed_entry_id = bpf.program(enter).unwrap().info()?.id();
@@ -359,8 +457,7 @@ mod tests {
         }
         let (mut bpf, data, _) = ReceiveTrace::load_unattached_for_test()?;
         let missing_btf = without_target(data, "__skb_recv_udp")?;
-        let map = bpf.take_map("RECEIVE_TRACE");
-        assert!(ReceiveTrace::attach(&mut bpf, &missing_btf, map.as_ref()).is_err());
+        assert!(ReceiveTrace::attach(&mut bpf, &missing_btf).is_err());
         Ok(())
     }
 

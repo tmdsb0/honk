@@ -21,23 +21,80 @@ use super::{
     probe::BatchCapability, validate_udp_decision_transition,
 };
 
-/// Parse the running kernel version from /proc/version.
-/// Returns `(major, minor, patch)` on success; `patch` defaults to 0
-/// if the version string only carries two components.
+/// Parse the running kernel release into `(major, minor, patch)`.
+///
+/// `/proc/sys/kernel/osrelease` carries exactly the release string (e.g.
+/// `6.12.114-0612114-generic`), unlike `/proc/version` whose third token is an
+/// implementation detail. Only the leading decimal groups are parsed, so
+/// suffixes such as `-generic`, `+`, `-rcN` or vendor builds never turn a
+/// perfectly capable 6.12+/7.x kernel into an unparsable release.
 fn kernel_version() -> Option<(u32, u32, u32)> {
-    let version = std::fs::read_to_string("/proc/version").ok()?;
-    let ver_str = version.split_whitespace().nth(2)?;
-    let parts: Vec<&str> = ver_str.split('.').collect();
-    if parts.len() >= 2 {
-        let major = parts[0].parse::<u32>().ok()?;
-        let minor = parts[1].parse::<u32>().ok()?;
-        let patch = parts
-            .get(2)
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
-        Some((major, minor, patch))
-    } else {
-        None
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .or_else(|_| {
+            std::fs::read_to_string("/proc/version").map(|version| {
+                version
+                    .split_whitespace()
+                    .nth(2)
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+        })
+        .ok()?;
+    parse_kernel_release(release.trim())
+}
+
+/// Extract the first three decimal groups from a kernel release string.
+#[inline(always)]
+fn parse_kernel_release(release: &str) -> Option<(u32, u32, u32)> {
+    let mut groups = [0u32; 3];
+    let mut found = 0usize;
+    let mut current = 0u32;
+    let mut in_digits = false;
+    for byte in release.bytes() {
+        if byte.is_ascii_digit() {
+            current = current
+                .checked_mul(10)?
+                .checked_add(u32::from(byte - b'0'))?;
+            in_digits = true;
+        } else if in_digits {
+            if found < 3 {
+                groups[found] = current;
+            }
+            found += 1;
+            current = 0;
+            in_digits = false;
+            if found >= 3 {
+                break;
+            }
+        }
+    }
+    if in_digits && found < 3 {
+        groups[found] = current;
+        found += 1;
+    }
+    // A bare major number is not a kernel release; "X.Y" implies patch 0.
+    (found >= 2).then_some((groups[0], groups[1], groups[2]))
+}
+
+#[cfg(test)]
+mod kernel_version_tests {
+    use super::parse_kernel_release;
+
+    #[test]
+    fn parses_vendor_suffixed_and_future_releases() {
+        assert_eq!(
+            parse_kernel_release("6.12.114-0612114-generic"),
+            Some((6, 12, 114))
+        );
+        assert_eq!(parse_kernel_release("6.12.0-rc3+"), Some((6, 12, 0)));
+        assert_eq!(parse_kernel_release("7.0.0"), Some((7, 0, 0)));
+        assert_eq!(parse_kernel_release("7.1"), Some((7, 1, 0)));
+        assert_eq!(
+            parse_kernel_release("6.12.114.1-custom"),
+            Some((6, 12, 114))
+        );
+        assert_eq!(parse_kernel_release("6"), None);
+        assert_eq!(parse_kernel_release("garbage"), None);
     }
 }
 
@@ -46,16 +103,13 @@ fn kernel_version() -> Option<(u32, u32, u32)> {
 /// Aya owns ordinary map operations; raw extensions provide batch reads/writes
 /// and locked persistent-allocator access. Every reclamation uses fence/grace.
 pub struct RealEbpfBackend {
-    maps: Option<programs::KernelMaps>,
-    programs: Option<std::sync::Arc<programs::ProgramLoader>>,
-    #[cfg(test)]
-    routing_test_targets: Option<[routing::Target; 2]>,
+    bpf: Option<Ebpf>,
     pin_root: PathBuf,
     /// Map names this instance claimed at attach, so cleanup unlinks what it owns instead of
     /// everything under a pin root that is shared with every other BPF consumer.
     pinned_maps: Vec<String>,
     /// Every TCX link on a configured interface, keyed by `(ifindex, direction)`,
-    /// plus the loaded TC program FDs. Created and replaced only through
+    /// plus the preloaded TC program FDs. Created and replaced only through
     /// `bindings::apply`; dropped by `detach_hooks`.
     bindings: bindings::InterfaceBindings,
     /// cgroup sock_create identity-capture link, held for the backend lifetime.
@@ -91,6 +145,14 @@ pub struct RealEbpfBackend {
     next_trace_policy: u32,
     #[cfg(feature = "native-api")]
     trace_dictionaries: crate::observe::flows::kernel::KernelTraceDictionaries,
+    #[cfg(feature = "native-api")]
+    receive_trace: Option<std::sync::Arc<receive_trace::ReceiveTrace>>,
+    #[cfg(feature = "native-api")]
+    receive_trace_available: bool,
+    #[cfg(feature = "native-api")]
+    receive_trace_attempted: bool,
+    #[cfg(feature = "native-api")]
+    receive_trace_retry_at: Option<std::time::Instant>,
     udp_staging_quiesce_incomplete: bool,
     aux_deletes: AuxDeleteTally,
 }
@@ -131,8 +193,8 @@ impl RealEbpfBackend {
         );
         {
             let map = self
-                .maps_mut()?
-                .get_mut("LISTEN_SOCKET_MAP")
+                .bpf_mut()?
+                .map_mut("LISTEN_SOCKET_MAP")
                 .ok_or_else(|| anyhow::anyhow!("map 'LISTEN_SOCKET_MAP' not found"))?;
             let mut sockets = AyaSockMap::try_from(map)
                 .map_err(|error| anyhow::anyhow!("map 'LISTEN_SOCKET_MAP': {error}"))?;
@@ -150,40 +212,17 @@ impl RealEbpfBackend {
     }
 
     #[inline(always)]
-    fn maps(&self) -> anyhow::Result<&programs::KernelMaps> {
-        self.maps
+    fn bpf(&self) -> anyhow::Result<&Ebpf> {
+        self.bpf
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("eBPF object not loaded"))
     }
 
-    fn maps_mut(&mut self) -> anyhow::Result<&mut programs::KernelMaps> {
-        self.maps
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("eBPF object not loaded"))
-    }
-
-    fn startup_object_mut(&mut self) -> anyhow::Result<&mut Ebpf> {
-        let programs = self
-            .programs
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("eBPF object not loaded"))?;
-        let programs = std::sync::Arc::get_mut(programs)
-            .ok_or_else(|| anyhow::anyhow!("program loader is already shared"))?;
-        Ok(programs.startup_object_mut())
-    }
-
-    #[cfg(test)]
-    fn bpf(&self) -> anyhow::Result<parking_lot::MutexGuard<'_, Ebpf>> {
-        Ok(self
-            .programs
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("eBPF object not loaded"))?
-            .object())
-    }
-
-    #[cfg(test)]
+    #[inline(always)]
     fn bpf_mut(&mut self) -> anyhow::Result<&mut Ebpf> {
-        self.startup_object_mut()
+        self.bpf
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("eBPF object not loaded"))
     }
 }
 
@@ -197,7 +236,6 @@ mod interface_state;
 mod layout;
 mod observation;
 mod process_name;
-pub(crate) mod programs;
 #[cfg(feature = "native-api")]
 pub(crate) mod receive_trace;
 mod retirement;
@@ -224,11 +262,14 @@ fn conn_key(outbound: u8, domain: u32, ipver: u32) -> u32 {
 }
 
 fn set_array_value<V: Pod>(
-    map: &mut aya::maps::Map,
+    bpf: &mut Ebpf,
     name: &str,
     index: u32,
     value: &V,
 ) -> anyhow::Result<()> {
+    let map = bpf
+        .map_mut(name)
+        .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?;
     let mut array = AyaArray::<_, V>::try_from(map)
         .map_err(|error| anyhow::anyhow!("map '{name}': {error}"))?;
     array
@@ -245,8 +286,8 @@ impl RealEbpfBackend {
         name: &str,
     ) -> anyhow::Result<AyaHashMap<&'a AyaMapData, K, V>> {
         let map = self
-            .maps()?
-            .get(name)
+            .bpf()?
+            .map(name)
             .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?;
         AyaHashMap::try_from(map).map_err(|error| anyhow::anyhow!("map '{name}': {error}"))
     }
@@ -256,8 +297,8 @@ impl RealEbpfBackend {
         name: &str,
     ) -> anyhow::Result<AyaHashMap<&'a mut AyaMapData, K, V>> {
         let map = self
-            .maps_mut()?
-            .get_mut(name)
+            .bpf_mut()?
+            .map_mut(name)
             .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?;
         AyaHashMap::try_from(map).map_err(|error| anyhow::anyhow!("map '{name}': {error}"))
     }
@@ -359,7 +400,7 @@ impl RealEbpfBackend {
     {
         let mut projected = Vec::with_capacity(syscall::BPF_BATCH_CHUNK);
         if syscall::bpf_lookup_batch_scan_cb_flags::<K, FlowMapValue<V>>(
-            self.maps()?,
+            self.bpf()?,
             &self.cap_flow_lookup_batch,
             name,
             aya_obj::generated::BPF_F_LOCK as u64,
@@ -378,7 +419,7 @@ impl RealEbpfBackend {
             core::mem::size_of::<K>() == 40,
             "tuple scan key must be 40 bytes"
         );
-        let fd = syscall::map_fd(self.maps()?, name)?;
+        let fd = syscall::map_fd(self.bpf()?, name)?;
         let mut next = match cursor.next_key.take() {
             Some(key) => Some(key),
             None => syscall::next_flow_key(fd, None)?,
@@ -413,7 +454,7 @@ impl RealEbpfBackend {
         slots: [u32; N],
     ) -> anyhow::Result<[u64; N]> {
         let mut totals = [0u64; N];
-        let Some(map) = self.maps()?.get(name) else {
+        let Some(map) = self.bpf()?.map(name) else {
             return Ok(totals);
         };
         let array = AyaPerCpuArray::<_, u64>::try_from(map)
@@ -472,20 +513,13 @@ impl RealEbpfBackend {
     }
 
     fn array_set<V: Pod>(&mut self, name: &str, index: u32, value: &V) -> anyhow::Result<()> {
-        set_array_value(
-            self.maps_mut()?
-                .get_mut(name)
-                .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?,
-            name,
-            index,
-            value,
-        )
+        set_array_value(self.bpf_mut()?, name, index, value)
     }
 
     fn array_get<V: Pod>(&self, name: &str, index: u32) -> anyhow::Result<Option<V>> {
         let map = self
-            .maps()?
-            .get(name)
+            .bpf()?
+            .map(name)
             .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?;
         let array = AyaArray::<_, V>::try_from(map)
             .map_err(|error| anyhow::anyhow!("map '{name}': {error}"))?;
@@ -502,7 +536,7 @@ impl RealEbpfBackend {
         chunk_size: usize,
         visit: &mut ChunkVisitor<'_, K, V>,
     ) -> anyhow::Result<()> {
-        let bpf = self.maps()?;
+        let bpf = self.bpf()?;
         if bpf_lookup_batch_scan_cb(bpf, &self.cap_lookup_batch, name, visit)? {
             return Ok(());
         }
@@ -553,17 +587,6 @@ impl EbpfBackend for RealEbpfBackend {
         commit: super::interface::BindingCommit,
     ) -> Vec<std::os::fd::OwnedFd> {
         self.bindings.commit(commit)
-    }
-
-    fn prepare_tc_programs(
-        &self,
-        programs: &[super::interface::TcProgram],
-    ) -> anyhow::Result<Option<programs::TcProgramPreparation>> {
-        RealEbpfBackend::prepare_tc_programs(self, programs).map(Some)
-    }
-
-    fn commit_tc_programs(&mut self, batch: programs::TcProgramBatch) -> anyhow::Result<()> {
-        RealEbpfBackend::commit_tc_programs(self, batch)
     }
 
     fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()> {
@@ -730,7 +753,7 @@ impl EbpfBackend for RealEbpfBackend {
             "retirement ownership is unresolved"
         );
         Ok(TcpSocketOwnership::Kernel(tcp_binding::lookup(
-            self.maps()?,
+            self.bpf()?,
             fd,
         )?))
     }
@@ -740,10 +763,10 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn verify_udp_decision_sequence(&self) -> anyhow::Result<()> {
-        validate_loaded_udp_decision_sequence(self.maps()?).map(|_| ())
+        validate_loaded_udp_decision_sequence(self.bpf()?).map(|_| ())
     }
     fn udp_decision_sequence_status(&self) -> anyhow::Result<UdpDecisionSequenceStatus> {
-        let sequence = validate_loaded_udp_decision_sequence(self.maps()?)?;
+        let sequence = validate_loaded_udp_decision_sequence(self.bpf()?)?;
         Ok(UdpDecisionSequenceStatus {
             next: sequence.next & UDP_DECISION_SEQUENCE_MASK,
             generation: udp_decision_token_generation(sequence.next),
@@ -808,7 +831,7 @@ impl EbpfBackend for RealEbpfBackend {
         if live {
             return Ok(false);
         }
-        reset_udp_decision_sequence_locked(self.maps()?, generation)?;
+        reset_udp_decision_sequence_locked(self.bpf()?, generation)?;
         Ok(true)
     }
 
@@ -870,10 +893,52 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     #[cfg(feature = "native-api")]
-    fn prepare_receive_trace(&self) -> Option<programs::ReceiveTracePreparation> {
-        self.programs
-            .as_ref()
-            .map(|loader| loader.prepare_receive_trace())
+    fn receive_trace(&mut self) -> Option<std::sync::Arc<receive_trace::ReceiveTrace>> {
+        if let Some(trace) = &self.receive_trace {
+            return Some(trace.clone());
+        }
+        let now = std::time::Instant::now();
+        // Only symbol-resolution failures are safe to retry: they happen before
+        // any program is loaded. A partially loaded Aya program cannot be
+        // loaded again, so every other failure stays terminal for this process.
+        if self.receive_trace_attempted {
+            match self.receive_trace_retry_at {
+                Some(at) if now >= at => {}
+                _ => return None,
+            }
+        }
+        self.receive_trace_attempted = true;
+        self.receive_trace_retry_at = None;
+        if !self.receive_trace_available {
+            warn!(
+                ipv4_unavailable = true,
+                ipv6_unavailable = true,
+                "kernel UDP trace unavailable: checked BTF offsets missing"
+            );
+            return None;
+        }
+        let result = btf::load_kernel().and_then(|(_, kernel_btf)| {
+            receive_trace::ReceiveTrace::attach(self.bpf_mut()?, &kernel_btf)
+        });
+        match result {
+            Ok(trace) => self.receive_trace = Some(trace),
+            Err(error) => {
+                let retryable = error
+                    .downcast_ref::<receive_trace::TargetsUnavailable>()
+                    .is_some();
+                if retryable {
+                    self.receive_trace_retry_at = Some(now + std::time::Duration::from_secs(60));
+                }
+                warn!(
+                    error = %format_args!("{error:#}"),
+                    retryable,
+                    ipv4_unavailable = true,
+                    ipv6_unavailable = true,
+                    "kernel UDP trace attach unavailable"
+                );
+            }
+        }
+        self.receive_trace.clone()
     }
 
     fn redirect_track_for_each_chunk(
@@ -952,7 +1017,19 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn get_bpf_stats(&self, k: u32) -> anyhow::Result<Option<u64>> {
-        self.array_get("BPF_STATS_MAP", k)
+        // BPF_STATS_MAP is per-CPU, so the kernel path needs no atomic RMW on
+        // a shared cacheline. Userspace sums the per-CPU values on read.
+        let map = self
+            .bpf()?
+            .map("BPF_STATS_MAP")
+            .ok_or_else(|| anyhow::anyhow!("map 'BPF_STATS_MAP' not found"))?;
+        let array = AyaPerCpuArray::<_, u64>::try_from(map)
+            .map_err(|error| anyhow::anyhow!("map 'BPF_STATS_MAP': {error}"))?;
+        match array.get(&k, 0) {
+            Ok(values) => Ok(Some(values.iter().sum())),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(error) => Err(anyhow::anyhow!("map 'BPF_STATS_MAP' get[{k}]: {error}")),
+        }
     }
 
     fn detach_hooks(&mut self) -> anyhow::Result<()> {
@@ -972,10 +1049,10 @@ impl EbpfBackend for RealEbpfBackend {
 
     fn attach_dae0_programs(&mut self) -> anyhow::Result<()> {
         // Both LAN and WAN-only deployments need this link to deliver proxied replies.
-        let id = Self::attach_tc(self.startup_object_mut()?, "dae0_ingress", "dae0")
+        let id = Self::attach_tc(self.bpf_mut()?, "dae0_ingress", "dae0")
             .map_err(|error| anyhow::anyhow!("attach dae0_ingress: {error}"))?;
         let program: &mut aya::programs::SchedClassifier = self
-            .startup_object_mut()?
+            .bpf_mut()?
             .program_mut("dae0_ingress")
             .ok_or_else(|| anyhow::anyhow!("dae0_ingress program disappeared"))?
             .try_into()?;
@@ -996,10 +1073,10 @@ impl EbpfBackend for RealEbpfBackend {
         // in the attaching thread's netns; the link handle persists after
         // switching back to the host netns.
         crate::daens::with_daens_netns("attach dae0peer_ingress", move || {
-            let id = Self::attach_tc(self.startup_object_mut()?, "dae0peer_ingress", "dae0peer")
+            let id = Self::attach_tc(self.bpf_mut()?, "dae0peer_ingress", "dae0peer")
                 .map_err(|error| anyhow::anyhow!("attach dae0peer_ingress: {error}"))?;
             let program: &mut aya::programs::SchedClassifier = self
-                .startup_object_mut()?
+                .bpf_mut()?
                 .program_mut("dae0peer_ingress")
                 .ok_or_else(|| anyhow::anyhow!("dae0peer_ingress program disappeared"))?
                 .try_into()?;
@@ -1023,7 +1100,7 @@ impl EbpfBackend for RealEbpfBackend {
         crate::daens::with_daens_netns("attach tproxy_sk_lookup", move || {
             let netns = crate::daens::daens_fd()?;
             let p: &mut aya::programs::SkLookup = self
-                .startup_object_mut()?
+                .bpf_mut()?
                 .program_mut("tproxy_sk_lookup")
                 .ok_or_else(|| anyhow::anyhow!("tproxy_sk_lookup program not found"))?
                 .try_into()?;
@@ -1064,8 +1141,8 @@ impl EbpfBackend for RealEbpfBackend {
         // Invalidation precedes removal: a partial failure must not permit READY.
         self.listeners_published = false;
         let map = self
-            .maps_mut()?
-            .get_mut("LISTEN_SOCKET_MAP")
+            .bpf_mut()?
+            .map_mut("LISTEN_SOCKET_MAP")
             .ok_or_else(|| anyhow::anyhow!("listener socket map unavailable"))?;
         let mut sockets = AyaSockMap::try_from(map)?;
         for key in 0..10 {
@@ -1090,19 +1167,20 @@ impl EbpfBackend for RealEbpfBackend {
         // The root and generated freplace links remain valid until every
         // network entry point is detached above.
         self.routing_generation = None;
-        // Stop the DaeEvent consumer, which owns a duplicate map handle.
+        // Stop the DaeEvent ringbuf consumer as well; it owns the
+        // EVENT_RINGBUF MapData taken out of the Ebpf object.
         if let Some(h) = self.event_flush_handle.take() {
             h.abort();
             let _ = h.await;
         }
         #[cfg(feature = "native-api")]
-        if let Some(programs) = &self.programs {
-            programs.close_receive_trace();
-        }
+        drop(self.receive_trace.take());
 
-        // Pending verifier jobs retain original map FDs until their blocking work finishes.
-        self.programs = None;
-        self.maps = None;
+        // Drop object map fds before unlinking generation-owned pins; both
+        // persistent sequence pins survive ordinary shutdown.
+        if let Some(bpf) = self.bpf.take() {
+            drop(bpf);
+        }
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         if let Err(error) = self.remove_nonpersistent_pins() {
@@ -1129,10 +1207,6 @@ impl Drop for RealEbpfBackend {
         }
         if let Some(handle) = self.log_flush_handle.take() {
             handle.abort();
-        }
-        #[cfg(feature = "native-api")]
-        if let Some(programs) = &self.programs {
-            programs.close_receive_trace();
         }
         self.routing_generation = None;
         let _ = self.remove_nonpersistent_pins();

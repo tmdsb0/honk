@@ -56,7 +56,6 @@ pub(super) enum UdpSlowPathWork {
         admission: crate::control::dns_control::AdmittedDnsQuery,
         data: Bytes,
         validated: ValidatedDnsQuery,
-        audit: Option<crate::audit::DnsAuditQuery>,
         #[cfg(feature = "native-api")]
         packet_route: Option<PacketRoute>,
     },
@@ -64,7 +63,6 @@ pub(super) enum UdpSlowPathWork {
         runtime: crate::dns::runtime::RuntimeLease,
         udp_permit: tokio::sync::OwnedSemaphorePermit,
         response: Vec<u8>,
-        audit: Option<crate::audit::DnsAuditQuery>,
         #[cfg(feature = "native-api")]
         query: Bytes,
         #[cfg(feature = "native-api")]
@@ -145,7 +143,6 @@ pub(super) fn begin_udp_slow_path_at(
             stats,
             DatagramPayload::Borrowed(data),
             validated,
-            src_addr,
         );
     }
     let Some(permit) = try_admit_udp_slow_path(stats, concurrency_limit) else {
@@ -176,11 +173,7 @@ fn begin_udp_dns_query(
     stats: &StatsManager,
     data: DatagramPayload<'_>,
     validated: ValidatedDnsQuery,
-    src_addr: SocketAddr,
 ) -> UdpSlowPathWork {
-    let audit = dns_controller
-        .dns_audit()
-        .begin(data.as_slice(), validated.ingress(), src_addr);
     let admission = match dns_controller.try_admit_query(true) {
         Ok(admission) => {
             stats.record_udp_slow_permit_accepted();
@@ -193,7 +186,6 @@ fn begin_udp_dns_query(
                     runtime,
                     udp_permit,
                     response: crate::dns::response::build_dns_refused(data.as_slice()),
-                    audit,
                     #[cfg(feature = "native-api")]
                     query: data.into_bytes(),
                     #[cfg(feature = "native-api")]
@@ -203,9 +195,6 @@ fn begin_udp_dns_query(
                 };
             }
             stats.record_udp_slow_permit_rejected();
-            if let Some(audit) = audit {
-                audit.discard();
-            }
             return UdpSlowPathWork::Done;
         }
     };
@@ -213,7 +202,6 @@ fn begin_udp_dns_query(
         admission,
         data: data.into_bytes(),
         validated,
-        audit,
         #[cfg(feature = "native-api")]
         packet_route: None,
     }
@@ -398,8 +386,7 @@ impl UdpLoopState {
             .flatten();
         // Config remains guarded through synchronous admission, not through spawned I/O.
         if let Some(validated) = validated_dns {
-            let work =
-                begin_udp_dns_query(&self.dns_controller, &self.stats, data, validated, src_addr);
+            let work = begin_udp_dns_query(&self.dns_controller, &self.stats, data, validated);
             #[cfg(feature = "native-api")]
             let work = work.with_packet_route(packet_route);
             return work;
@@ -574,7 +561,6 @@ impl UdpLoopState {
                 admission,
                 data,
                 validated,
-                audit,
                 #[cfg(feature = "native-api")]
                 packet_route,
             } => {
@@ -605,7 +591,6 @@ impl UdpLoopState {
                                 src_addr,
                                 original_dst,
                                 validated,
-                                audit,
                             )
                             .await;
                     };
@@ -628,7 +613,6 @@ impl UdpLoopState {
                 runtime,
                 udp_permit,
                 response,
-                audit,
                 #[cfg(feature = "native-api")]
                 query,
                 #[cfg(feature = "native-api")]
@@ -654,9 +638,6 @@ impl UdpLoopState {
                 #[cfg(feature = "native-api")]
                 let observer = observation
                     .observer(|| self.handle.diagnostics.read().generation, "client_dns");
-                if let Some(audit) = audit {
-                    audit.finish(&response, None);
-                }
                 self.udp_pool.spawn_slow_path(async move {
                     let _guard = guard;
                     let _permit = udp_permit;

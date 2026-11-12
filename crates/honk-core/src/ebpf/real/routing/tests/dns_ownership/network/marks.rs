@@ -510,9 +510,9 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                 aya::maps::SkStorage::<_, SocketIdentity>::try_from(
                     fixture
                         .backend
-                        .maps_mut()
+                        .bpf_mut()
                         .unwrap()
-                        .get_mut("SOCKET_IDENTITY")
+                        .map_mut("SOCKET_IDENTITY")
                         .unwrap(),
                 )
                 .unwrap()

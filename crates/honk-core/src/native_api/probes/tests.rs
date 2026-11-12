@@ -13,6 +13,12 @@ async fn state(mut config: Config) -> Arc<NativeState> {
     config.experimental.native_api.allow_anonymous_loopback = true;
 
     config.ensure_builtin_nodes();
+    // Mirror production bootstrap: capture the node and group set before the
+    // config is moved into the control plane, so each node's named detour can
+    // be bound. Without this a node that names a front (dialer-proxy) has no
+    // bound path, and its manual probe dials directly instead of riding it.
+    let nodes = config.nodes.clone();
+    let groups = config.groups.clone();
     let resolver = crate::dns::DnsResolver::new(&config.dns).unwrap();
     let forwarder = resolver.forwarder();
     let mut control = crate::control::ControlPlane::new(
@@ -24,6 +30,33 @@ async fn state(mut config: Config) -> Arc<NativeState> {
         forwarder,
     )
     .unwrap();
+    let outbound_runtime = control.runtime_registry().read().clone();
+    let pinned_groups = control.group_manager().read().clone();
+    crate::control::node_detour::bind_node_detours(
+        &outbound_runtime,
+        &nodes,
+        &control.proxy_registry(),
+        &groups,
+        &pinned_groups,
+    );
+    #[cfg(test)]
+    {
+        let held = control.runtime_registry().read().clone();
+        for n in &nodes {
+            if let Some(detour_name) = n.detour_name() {
+                let via_outbound = outbound_runtime.detour_for(n.id).is_some();
+                let via_held = held.detour_for(n.id).is_some();
+                eprintln!(
+                    "HARNESS-DETACH node={:?} outbound_ptr={:?} held_ptr={:?} via_outbound={} via_held={}",
+                    detour_name,
+                    std::sync::Arc::as_ptr(&outbound_runtime),
+                    std::sync::Arc::as_ptr(&held),
+                    via_outbound,
+                    via_held,
+                );
+            }
+        }
+    }
     let state = NativeState::new(
         &mut control,
         "127.0.0.1:9527".parse().unwrap(),
@@ -612,6 +645,148 @@ async fn group_http_probe_measures_loopback_node_and_custom_check_port() {
         result["result"]["results"][0]["latency_ms"]
             .as_f64()
             .is_some()
+    );
+    peer.await.unwrap();
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+}
+
+/// A manual probe of a node that names its own front (dialer-proxy) must ride
+/// that front exactly like real flows do. Before the fix the node probe ran
+/// with no detour at all and failed with a generic `probe_failed`, while the
+/// automatic health check -- which reads the node's own binding -- succeeded.
+#[tokio::test]
+async fn a_node_probe_rides_the_detour_the_node_names() {
+    let front = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front_port = front.local_addr().unwrap().port();
+    let check = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let check_port = check.local_addr().unwrap().port();
+
+    let mut config = Config::default();
+    config.global.tcp_check_url = vec![format!("http://127.0.0.1:{check_port}/check")];
+    config
+        .nodes
+        .push(Node::from_share_link(&format!("socks5://127.0.0.1:{front_port}#front")).unwrap());
+    // The back node's own server is named by a literal address: the dial
+    // resolves it at this end (see `detour::resolve_endpoint`) and then asks
+    // the front to carry it, so no DNS is involved in the test.
+    let back = Node::from_share_link("socks5://127.0.0.1:9?dialer-proxy=front#back").unwrap();
+    let back_id = back.id;
+    config.nodes.push(back);
+    let state = state(config).await;
+
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = front.accept().await.unwrap();
+        // `connect_server` tunnels to the back node's own server through the
+        // front and then `dial_with_stream` speaks the back protocol over that
+        // tunnel, so one TCP connection to the front carries two SOCKS5
+        // stages: the front is asked to reach the back server, and over that
+        // link the back server is asked for the check address. Each greeting
+        // is read as version + nmethods + nmethods bytes -- not a fixed two
+        // bytes -- so the trailing method byte cannot poison the CONNECT
+        // parse.
+        // Stage one: the front is asked to reach the back node's own server.
+        assert_eq!(
+            socket.read_u8().await.unwrap(),
+            5,
+            "the front must speak SOCKS5"
+        );
+        let methods = socket.read_u8().await.unwrap();
+        let mut offered = vec![0u8; usize::from(methods)];
+        socket.read_exact(&mut offered).await.unwrap();
+        assert!(offered.contains(&0), "the front must offer no-auth");
+        socket.write_all(&[5, 0]).await.unwrap();
+        let mut header = [0; 4];
+        socket.read_exact(&mut header).await.unwrap();
+        assert_eq!(
+            header,
+            [5, 1, 0, 1],
+            "the front must receive a CONNECT for an IPv4 target"
+        );
+        let mut destination = [0; 6];
+        socket.read_exact(&mut destination).await.unwrap();
+        assert_eq!(
+            &destination,
+            &[127, 0, 0, 1, 0, 9],
+            "the front must be asked to reach the back server"
+        );
+        socket
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+            .await
+            .unwrap();
+        // Stage two: over that link the back protocol speaks to the check
+        // target, so the same peer now plays the back server's role.
+        assert_eq!(
+            socket.read_u8().await.unwrap(),
+            5,
+            "the back must speak SOCKS5 over the tunnel"
+        );
+        let methods = socket.read_u8().await.unwrap();
+        let mut offered = vec![0u8; usize::from(methods)];
+        socket.read_exact(&mut offered).await.unwrap();
+        assert!(offered.contains(&0), "the back must be offered no-auth");
+        socket.write_all(&[5, 0]).await.unwrap();
+        let mut header = [0; 4];
+        socket.read_exact(&mut header).await.unwrap();
+        assert_eq!(
+            header,
+            [5, 1, 0, 1],
+            "the back must receive a CONNECT for an IPv4 target"
+        );
+        let mut destination = [0; 6];
+        socket.read_exact(&mut destination).await.unwrap();
+        assert_eq!(
+            &destination,
+            &[
+                127,
+                0,
+                0,
+                1,
+                (check_port >> 8) as u8,
+                (check_port & 0xff) as u8
+            ],
+            "the back must be asked for the check address"
+        );
+        socket
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+            .await
+            .unwrap();
+        receive_headers(&mut socket).await;
+        socket
+            .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let input = request(
+        json!({"type":"node","node_id":back_id.to_string()}),
+        "http",
+        json!(["tcp"]),
+        "ipv4",
+    );
+    let (stop, receiver) = watch::channel(false);
+    let worker = state.observation.probes.start(Arc::clone(&state), receiver);
+    let accepted = body(
+        create(
+            &state,
+            http_request(&input, "node-detour"),
+            &RequestId("node-detour".into()),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    let result = terminal(&state, accepted["operation_id"].as_str().unwrap()).await;
+    assert_eq!(result["status"], "succeeded", "{result}");
+    assert_eq!(
+        result["result"]["results"][0]["state"], "healthy",
+        "{result}"
+    );
+    assert!(
+        result["result"]["results"][0]["latency_ms"]
+            .as_f64()
+            .is_some(),
+        "{result}"
     );
     peer.await.unwrap();
     stop.send(true).unwrap();

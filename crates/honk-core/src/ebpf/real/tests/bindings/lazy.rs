@@ -50,6 +50,7 @@ fn down_veth(name: &str, peer: &str) -> u32 {
 /// What startup returned plus everything a reconcile round needs.
 struct Started {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    programs: BTreeMap<TcProgram, u32>,
     config: Arc<RwLock<Arc<honk_config::Config>>>,
     degradations: Arc<Degradations>,
     handoff: Option<InterfaceHandoff>,
@@ -90,6 +91,7 @@ fn start_with_read(
     config.global.lan_interface = names(lan);
     config.global.wan_interface = names(wan);
     Started {
+        programs: program_ids(&backend),
         ebpf: Arc::new(RwLock::new(Box::new(backend))),
         config: Arc::new(RwLock::new(Arc::new(config))),
         degradations,
@@ -140,7 +142,7 @@ type Kernel = BTreeMap<(String, Direction), (TcProgram, u32)>;
 
 /// What the owner holds, each record proven against the kernel.
 async fn kernel_bound(started: &Started) -> Kernel {
-    kernel_held(&started.ebpf)
+    kernel_held(&started.ebpf, &started.programs)
         .await
         .into_iter()
         .map(|h| {

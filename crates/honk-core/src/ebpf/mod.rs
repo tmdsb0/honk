@@ -407,8 +407,10 @@ pub enum PnameSupport {
     Full,
     /// Kernel argv capture is unavailable; rules see the thread name.
     ThreadName,
-    /// The cgroup hooks are not attached; `pname()` never matches and
-    /// `!pname()` always does.
+    /// Reserved for a backend whose socket-identity hooks are absent. The real
+    /// eBPF backend treats a missing or partial cgroup attachment as a fatal
+    /// startup error, so it never publishes this variant. `pname()` would
+    /// never match and `!pname()` would always match if a backend ever did.
     Unavailable,
 }
 
@@ -429,7 +431,7 @@ pub(crate) fn record_pname_routing(
         }),
         PnameSupport::Unavailable => Some(Issue {
             code: "pname_routing_disabled",
-            message: "cgroup v2 is unavailable; pname() conditions see no process name, so positive ones never match and negated ones always match.",
+            message: "socket identity hooks are unavailable; pname() conditions see no process name, so positive ones never match and negated ones always match. The real eBPF backend fails startup before reaching this state.",
             reason: "cgroup_unavailable",
         }),
     };
@@ -570,21 +572,6 @@ pub trait EbpfBackend: Send + Sync {
     /// FDs plus dup'd link FDs.
     #[cfg(feature = "ebpf")]
     fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot>;
-
-    /// Prepare a blocking verifier job without retaining backend ownership.
-    #[cfg(feature = "ebpf")]
-    fn prepare_tc_programs(
-        &self,
-        _programs: &[interface::TcProgram],
-    ) -> anyhow::Result<Option<real::programs::TcProgramPreparation>> {
-        Ok(None)
-    }
-
-    /// Install the current routing generation before making prepared targets bindable.
-    #[cfg(feature = "ebpf")]
-    fn commit_tc_programs(&mut self, _batch: real::programs::TcProgramBatch) -> anyhow::Result<()> {
-        Ok(())
-    }
 
     /// Apply the commit and return replaced or removed link FDs. The caller
     /// must close them outside any lock: the last close takes the rtnl lock.
@@ -780,7 +767,7 @@ pub trait EbpfBackend: Send + Sync {
     }
 
     #[cfg(all(feature = "ebpf", feature = "native-api"))]
-    fn prepare_receive_trace(&self) -> Option<real::programs::ReceiveTracePreparation> {
+    fn receive_trace(&mut self) -> Option<std::sync::Arc<real::receive_trace::ReceiveTrace>> {
         None
     }
 

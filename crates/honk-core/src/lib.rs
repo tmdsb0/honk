@@ -9,11 +9,6 @@
 //! in dae netns"). Trait-based backends (real aya + mock) for testing
 //! without kernel eBPF support.
 
-#[cfg_attr(not(feature = "dns-syslog"), path = "audit/inert.rs")]
-mod audit;
-#[cfg(all(test, not(feature = "dns-syslog")))]
-#[path = "audit/inert_tests.rs"]
-mod audit_feature_tests;
 #[cfg(feature = "clash-api")]
 pub mod clash_api;
 pub mod config_diagnostics;
@@ -811,8 +806,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             !config.experimental.native_api.enabled,
             "native-api feature is required"
         );
-        #[cfg(not(feature = "dns-syslog"))]
-        audit::validate_config(&config.global)?;
         let requested_data_dir = PathBuf::from(&config.global.data_dir);
         let (runtime_data_dir, data_dir_creation_error) =
             prepare_runtime_data_dir(&requested_data_dir)?;
@@ -842,6 +835,21 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         // Make `direct`/`block` usable as group members without declaring them
         // in the config (Direct/Block protocols → DirectHandler/BlockHandler).
         config.ensure_builtin_nodes();
+
+        // Relay tuning is operational, not routing: apply it before the first
+        // flow so `global { relay_buf_size: '...' }` takes effect without a
+        // rebuild. An unparsable value keeps the compiled-in default.
+        let requested = &config.global.relay_buf_size;
+        let configured_relay_buf = honk_config::tuning::parse_size(requested)
+            .unwrap_or(honk_config::tuning::DEFAULT_RELAY_BUF_SIZE);
+        let effective_relay_buf = honk_config::tuning::set_relay_buf_size(configured_relay_buf);
+        if effective_relay_buf != configured_relay_buf {
+            warn!(
+                requested = configured_relay_buf,
+                effective = effective_relay_buf,
+                "relay_buf_size clamped to the supported range"
+            );
+        }
 
         // Effective log level: --debug flag > RUST_LOG env > config log_level >
         // "info".
@@ -1273,8 +1281,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32)
         .with_stale_reply_ttl(config.dns.cache.stale_reply_ttl)
         .with_policy_id(dns_policy)
-        .with_hosts_snapshot(hosts_snapshot)
-        .with_node_hosts(dns::node_host::index(&config)),
+        .with_hosts_snapshot(hosts_snapshot),
     );
     info!("DNS forwarder ready");
 
@@ -1290,9 +1297,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         resource_budget,
         Arc::clone(&degradations),
     )?;
-    honk_outbound::bootstrap::set_node_host_resolver(Some(dns::node_host::resolver(
-        &control_plane.dns_service(),
-    )));
     if nfqueue_unavailable {
         control_plane
             .startup_downgrades()

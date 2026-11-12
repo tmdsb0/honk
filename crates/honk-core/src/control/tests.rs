@@ -3362,7 +3362,7 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
             validated,
             ..
         } => {
-            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated, None)
+            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated)
                 .await;
         }
         _ => panic!("strict DNS must not enter the Ready endpoint queue"),
@@ -3427,7 +3427,7 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
             validated,
             ..
         } => {
-            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated, None)
+            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated)
                 .await;
         }
         _ => panic!("strict DNS must not enter the Initializing endpoint queue"),
@@ -4309,6 +4309,7 @@ fn preconnect_test_group(name: &str, policy: GroupPolicy, ids: Vec<uuid::Uuid>) 
         groups: vec![],
         default: None,
         final_outbound: None,
+        detour: None,
         check_url: None,
         check_interval: None,
         tolerance: 50,
@@ -4958,7 +4959,6 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                 12345,
                 &dae0_setup,
                 local_ip,
-                &crate::ebpf::interface::TcProgram::ALL,
             )
             .await?;
             backend.bind_test_interfaces(&["honk-lan0"], &["honk-wan0"]);

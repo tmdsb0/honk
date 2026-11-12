@@ -37,7 +37,7 @@ pub use server::NativeServer;
 pub(crate) use startup::NativeRuntime;
 pub use types::{ApiError, ErrorCode};
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -512,39 +512,57 @@ impl Ord for Candidate {
     }
 }
 
-fn connection(state: &NativeState, entry: &ConnectionEntry, full: bool) -> Connection {
-    let evidence = entry
+/// Rebuild a rule expression from the fields the tracker captured at
+/// registration time. Used when the flow-evidence store has no record (it can
+/// be reset by the recording toggle or pruned by its 300s TTL).
+fn fallback_rule_expression(entry: &ConnectionEntry) -> String {
+    if entry.rule_payload.is_empty() {
+        entry.rule.clone()
+    } else {
+        format!("{}({})", entry.rule, entry.rule_payload)
+    }
+}
+
+fn connection(
+    entry: &ConnectionEntry,
+    full: bool,
+    evidence: &HashMap<String, crate::observe::flows::ConnectionEvidence>,
+    terminal: bool,
+) -> Connection {
+    let found = entry
         .native_flow_id
         .as_deref()
-        .and_then(|id| state.observation.core.flows.connection_evidence(id));
+        .and_then(|id| evidence.get(id));
     Connection {
         id: entry.id.clone(),
         flow_id: entry.native_flow_id.clone(),
         pname: entry.process.clone(),
-        state: "active",
+        state: if terminal { "closed" } else { "active" },
         src: full.then(|| entry.source.clone()),
         dst: full.then(|| entry.destination.clone()),
         domain: full.then(|| entry.domain.clone()),
         outbound: entry.routed_outbound.clone(),
-        chain: evidence
-            .as_ref()
+        // Evidence chains are root-first UUIDs; tracker chains are node names
+        // leaf-first. Reverse for the wire contract. doona falls back to the
+        // raw string when a UUID has no name mapping, so names display fine.
+        chain: found
             .map(|value| value.chain.clone())
-            .unwrap_or_default(),
-        chain_source: evidence
-            .as_ref()
-            .map_or("unknown", |value| value.chain_source),
-        rule_id: evidence.as_ref().and_then(|value| value.rule_id.clone()),
-        rule_expression: evidence
-            .as_ref()
-            .and_then(|value| value.rule_expression.clone()),
-        rule_source: evidence
-            .as_ref()
-            .map_or(crate::observe::vocab::RuleSource::Unknown, |value| {
-                value.rule_source
-            }),
+            .unwrap_or_else(|| entry.chains.iter().rev().cloned().collect()),
+        chain_source: found.map_or("unknown", |value| value.chain_source),
+        rule_id: found.and_then(|value| value.rule_id.clone()),
+        rule_expression: found
+            .and_then(|value| value.rule_expression.clone())
+            .or_else(|| Some(fallback_rule_expression(entry))),
+        rule_source: found.map_or(crate::observe::vocab::RuleSource::Unknown, |value| {
+            value.rule_source
+        }),
         ingress: None,
-        domain_source: evidence.as_ref().and_then(|value| value.domain_source),
-        started_at: evidence.map(|value| value.started_at),
+        domain_source: found.and_then(|value| value.domain_source),
+        started_at: found.map(|value| value.started_at.clone()).or_else(|| {
+            SystemTime::now()
+                .checked_sub(entry.start_time.elapsed())
+                .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())
+        }),
         observed_by: "userspace",
         upload_bytes: Some(entry.upload.load(Ordering::Relaxed).to_string()),
         download_bytes: Some(entry.download.load(Ordering::Relaxed).to_string()),
@@ -569,6 +587,20 @@ fn connections(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respons
     let mut total_tcp = 0;
     let mut total_udp = 0;
     let mut selected: BinaryHeap<Candidate> = BinaryHeap::with_capacity(limit);
+    // Resolve every row's evidence in one pass: one lock and one flow-store
+    // prune for the whole page instead of one full prune per connection.
+    let mut flow_ids = HashSet::new();
+    state.tracker.visit(|entry| {
+        if let Some(id) = entry.native_flow_id.as_deref() {
+            flow_ids.insert(id.to_owned());
+        }
+    });
+    let evidence = state
+        .observation
+        .core
+        .flows
+        .connection_evidence_map(&flow_ids);
+    let terminal_ids = state.tracker.terminal_ids();
     state.tracker.visit(|entry| {
         let tcp = match entry.network.as_str() {
             "tcp" => true,
@@ -604,7 +636,7 @@ fn connections(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respons
         selected.push(Candidate {
             observed: entry.start_time,
             tcp,
-            value: connection(state, entry, full),
+            value: connection(entry, full, &evidence, terminal_ids.contains(&entry.id)),
         });
     });
     let truncated = total_tcp + total_udp > selected.len() as u64;

@@ -61,7 +61,6 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
             response,
             matches!(context.mode, ResolveMode::Strict)
                 || context.options.cache != crate::dns::forwarder::CacheAccess::Normal,
-            !context.options.node_host,
         )? {
             ResponseDirective::Accept {
                 response: analyzed,

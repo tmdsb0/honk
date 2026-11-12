@@ -21,26 +21,30 @@ impl Drop for StartupPins<'_> {
 impl RealEbpfBackend {
     /// `local_ip` is the IPv4 (`u32::from_ne_bytes` of the octets) of the first
     /// resolved LAN, else WAN, interface; 0 when it has none. No configured
-    /// interface is attached here: `bind_interfaces` does that. Only the TC
-    /// variants in `programs` are verified now; see
-    /// [`crate::ebpf::interface::initial_programs`].
+    /// interface is attached here: `bind_interfaces` does that.
     pub async fn load(
         obj: &[u8],
         pin_root: &Path,
         tproxy_port: u16,
         dae0: &crate::daens::Dae0Setup,
         local_ip: u32,
-        programs: &[crate::ebpf::interface::TcProgram],
     ) -> anyhow::Result<Self> {
-        let version =
-            kernel_version().ok_or_else(|| anyhow::anyhow!("cannot determine kernel version"))?;
-        anyhow::ensure!(
-            version >= (6, 12, 0),
-            "compiled routing requires Linux 6.12 or newer (running {}.{}.{})",
-            version.0,
-            version.1,
-            version.2
-        );
+        // 6.12 is a floor, not a ceiling: 6.13+/7.x must keep working. The
+        // version gate is advisory only. If the release string cannot be
+        // parsed we still attempt the load, and the real capability checks
+        // (BTF, TCX, cgroup, verifier) decide whether this kernel can run.
+        match kernel_version() {
+            Some(version) => anyhow::ensure!(
+                version >= (6, 12, 0),
+                "compiled routing requires Linux 6.12 or newer (running {}.{}.{})",
+                version.0,
+                version.1,
+                version.2
+            ),
+            None => warn!(
+                "kernel release could not be parsed; continuing with runtime capability checks"
+            ),
+        }
         layout::validate_object(obj)?;
         let (kernel_data, kernel_btf) = btf::load_kernel()?;
         let process_name_offsets = process_name::detect(&kernel_data);
@@ -86,6 +90,17 @@ impl RealEbpfBackend {
             }
         };
 
+        // Explicit escape hatch for a future kernel where bpf_redirect_peer is
+        // present but its applicability changed. Long-term this should be a
+        // runtime capability probe; the flag gives operators a safe downgrade
+        // path today without recompiling.
+        let use_redirect_peer = if std::env::var_os("HONK_DISABLE_REDIRECT_PEER").is_some() {
+            warn!("HONK_DISABLE_REDIRECT_PEER set: bpf_redirect_peer disabled");
+            0u8
+        } else {
+            use_redirect_peer
+        };
+
         let dae_param = DaeParam {
             tproxy_port: tproxy_port.to_be() as u32,
             dae0_ifindex,
@@ -115,7 +130,11 @@ impl RealEbpfBackend {
 
         // A stale pin must never hide a generation-owned map. Persistent
         // allocators are opened separately because generation reuse is forbidden.
-        let _ = std::fs::remove_file(pin_root.join("LISTEN_SOCKET_MAP"));
+        if let Err(error) = std::fs::remove_file(pin_root.join("LISTEN_SOCKET_MAP"))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(%error, "stale LISTEN_SOCKET_MAP pin could not be removed");
+        }
         let mut loader = EbpfLoader::new();
         loader
             .btf(&kernel_btf)
@@ -141,11 +160,7 @@ impl RealEbpfBackend {
         let mut bpf = loader.load(obj)?;
         layout::validate_loaded_maps(&bpf)?;
         layout::validate_socket_identity(&bpf)?;
-        syscall::validate_udp_decision_sequence_fd(syscall::map_raw_fd(
-            bpf.map(UDP_DECISION_SEQUENCE_MAP)
-                .ok_or_else(|| anyhow::anyhow!("UDP decision sequence map unavailable"))?,
-        ))?;
-        let retained_maps = programs::retain_consumer_maps(&mut bpf)?;
+        syscall::validate_loaded_udp_decision_sequence(&bpf)?;
         for name in [
             "COOKIE_PID_MAP",
             "UDP_DECISION_EPOCH",
@@ -279,25 +294,24 @@ impl RealEbpfBackend {
         // proxy-bound traffic. Skipping entries here marks every outbound
         // dead, so an insert error aborts startup.
         for index in 0..honk_ebpf_common::MAX_OUTBOUNDS * 6 {
-            set_array_value(
-                bpf.map_mut("OUTBOUND_CONNECTIVITY_MAP")
-                    .ok_or_else(|| anyhow::anyhow!("OUTBOUND_CONNECTIVITY_MAP unavailable"))?,
-                "OUTBOUND_CONNECTIVITY_MAP",
-                index,
-                &1u64,
-            )
-            .map_err(|e| anyhow::anyhow!("OUTBOUND_CONNECTIVITY_MAP init: {e}"))?;
+            set_array_value(&mut bpf, "OUTBOUND_CONNECTIVITY_MAP", index, &1u64)
+                .map_err(|e| anyhow::anyhow!("OUTBOUND_CONNECTIVITY_MAP init: {e}"))?;
         }
 
-        let bindings = bindings::InterfaceBindings::preload(&mut bpf, programs)?;
+        // Every TC variant is loaded up front, so reconciling interfaces later
+        // never runs the verifier. Before `EbpfLogger::init`, which holds the
+        // AYA_LOGS map fd the loads need.
+        let bindings = bindings::InterfaceBindings::preload(&mut bpf)?;
 
         info!("eBPF loaded and attached");
 
-        // Consumer handles are duplicates; the loader retains the original relocation FDs.
-        // Wait on the ringbuf fd with AsyncFd (official aya-log 0.4 pattern).
+        // aya-log must be initialized *after* programs are loaded, otherwise the
+        // AYA_LOGS map fd taken by the logger is not valid during BPF_PROG_LOAD.
+        //
+        // Wait on the ringbuf fd with AsyncFd (official aya-log 0.3 pattern).
         // A fixed-interval flush was waking every 100ms even when empty and
         // could burn a full core under high eBPF log volume via spawn_blocking.
-        let async_logger = match aya_log::EbpfLogger::init(&mut bpf) {
+        let log_flush_handle = match aya_log::EbpfLogger::init(&mut bpf) {
             Ok(logger) => {
                 debug!("eBPF logger initialized");
                 match unsafe {
@@ -306,7 +320,21 @@ impl RealEbpfBackend {
                         tokio::io::Interest::READABLE,
                     )
                 } {
-                    Ok(async_logger) => Some(async_logger),
+                    Ok(async_logger) => Some(tokio::spawn(async move {
+                        let mut async_logger = async_logger;
+                        loop {
+                            let mut guard = match async_logger.readable_mut().await {
+                                Ok(g) => g,
+                                Err(e) => {
+                                    debug!("eBPF logger AsyncFd wait failed: {}", e);
+                                    break;
+                                }
+                            };
+                            // Non-blocking drain; returns immediately when empty.
+                            guard.get_inner_mut().flush();
+                            guard.clear_ready();
+                        }
+                    })),
                     Err(e) => {
                         warn!(
                             "eBPF logger AsyncFd setup failed (logs will not be drained): {}",
@@ -324,41 +352,12 @@ impl RealEbpfBackend {
                 None
             }
         };
-        let tcp_live_pins = tcp_binding::take_live_pins(&mut bpf)?;
-        #[cfg(test)]
-        let routing_test_targets = routing::prepare_test_target(&mut bpf)?;
-        let (programs, maps) = programs::ProgramLoader::new(
-            bpf,
-            retained_maps,
-            #[cfg(feature = "native-api")]
-            receive_trace_offsets.is_some(),
-        )?;
-
-        // Spawned only after the last fallible step: an early return would detach them.
-        let log_flush_handle = async_logger.map(|mut async_logger| {
-            tokio::spawn(async move {
-                loop {
-                    let mut guard = match async_logger.readable_mut().await {
-                        Ok(g) => g,
-                        Err(e) => {
-                            debug!("eBPF logger AsyncFd wait failed: {}", e);
-                            break;
-                        }
-                    };
-                    // Non-blocking drain; returns immediately when empty.
-                    guard.get_inner_mut().flush();
-                    guard.clear_ready();
-                }
-            })
-        });
         let (expiry_tx, expiry_rx) = tokio::sync::mpsc::channel(RETIRE_BATCH_CAPACITY);
         let event_flush_handle = Some(tokio::spawn(consume_dae_events(event_fd, expiry_tx)));
+        let tcp_live_pins = tcp_binding::take_live_pins(&mut bpf)?;
 
         Ok(Self {
-            maps: Some(maps),
-            programs: Some(programs),
-            #[cfg(test)]
-            routing_test_targets,
+            bpf: Some(bpf),
             pin_root: pin_root.to_path_buf(),
             pinned_maps: std::mem::take(&mut pinned_maps.names),
             bindings,
@@ -388,6 +387,14 @@ impl RealEbpfBackend {
             next_trace_policy: 0,
             #[cfg(feature = "native-api")]
             trace_dictionaries: Default::default(),
+            #[cfg(feature = "native-api")]
+            receive_trace: None,
+            #[cfg(feature = "native-api")]
+            receive_trace_available: receive_trace_offsets.is_some(),
+            #[cfg(feature = "native-api")]
+            receive_trace_attempted: false,
+            #[cfg(feature = "native-api")]
+            receive_trace_retry_at: None,
             udp_staging_quiesce_incomplete: false,
             aux_deletes: Default::default(),
         })

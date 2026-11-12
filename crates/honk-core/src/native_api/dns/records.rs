@@ -1,5 +1,5 @@
 use crate::dns::query::IngressProfile;
-pub(crate) use crate::dns::response::presentation::{
+pub(crate) use crate::dns::response::native::{
     DnsAnswer, DnsQuestion, MAX_JSON_BYTES, ProjectionError, parse_type, project, question,
     record_type, status,
 };

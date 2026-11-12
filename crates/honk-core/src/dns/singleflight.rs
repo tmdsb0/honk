@@ -8,7 +8,6 @@ use tokio::sync::broadcast;
 
 use super::cache::{CacheKey, OperationKind};
 use super::forwarder::{DnsForwardError, ResolveMode};
-use super::outcome::Provenance;
 use super::query::DnsRequestMeta;
 use super::response::ResponseTemplate;
 
@@ -79,13 +78,7 @@ struct CounterSet {
     refreshes: AtomicU64,
 }
 
-pub(crate) struct FlightAnswer {
-    pub(crate) template: ResponseTemplate,
-    pub(crate) provenance: Provenance,
-    pub(crate) final_upstream: Option<String>,
-}
-
-pub(crate) type FlightResult = Result<Arc<FlightAnswer>, Arc<DnsForwardError>>;
+pub(crate) type FlightResult = Result<Arc<ResponseTemplate>, Arc<DnsForwardError>>;
 
 #[derive(Clone, Default)]
 pub(crate) struct Singleflight {
@@ -191,8 +184,7 @@ impl FlightWaiter {
 }
 
 impl FlightLeader {
-    /// `result` runs only when followers are attached, under the lock that orders them.
-    pub(crate) fn publish(mut self, result: impl FnOnce() -> FlightResult) {
+    pub(crate) fn publish(mut self, result: FlightResult) {
         let Some(key) = self.key.take() else {
             return;
         };
@@ -202,14 +194,12 @@ impl FlightLeader {
         };
         // Sending while `entries` is locked is completion's linearization point:
         // attached waiters are notified before a successor can be acquired.
-        if sender.receiver_count() > 0 {
-            let _ = sender.send(result());
-        }
+        let _ = sender.send(result);
     }
 
     pub(crate) fn fail(self, error: DnsForwardError) -> DnsForwardError {
         let error = Arc::new(error);
-        self.publish(|| Err(Arc::clone(&error)));
+        self.publish(Err(Arc::clone(&error)));
         Arc::try_unwrap(error).unwrap_or_else(DnsForwardError::Shared)
     }
 }
