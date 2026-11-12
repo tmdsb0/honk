@@ -73,13 +73,6 @@ pub(super) const GLOBAL_KEYS: &[&str] = &[
     "so_mark_from_dae",
     "log_level",
     "log_file",
-    "syslog_addr",
-    "syslog_dns_enabled",
-    "syslog_cee_enabled",
-    "syslog_dns_template",
-    "syslog_dns_json",
-    "syslog_hostname",
-    "syslog_app_name",
     "disable_waiting_network",
     "shutdown_wait_connections",
     "lan_interface",
@@ -106,6 +99,7 @@ pub(super) const GLOBAL_KEYS: &[&str] = &[
     "fallback_resolver",
     "bandwidth_max_tx",
     "bandwidth_max_rx",
+    "relay_buf_size",
     "udp_warm_node_count",
     "preconnect_node_count",
     "max_concurrent_dials",
@@ -332,55 +326,6 @@ pub(super) fn parse_global_section(
     if let Some(value) = settings.get("log_file").map(|text| text.unquote().raw()) {
         cfg.log_file = value.to_owned();
     }
-    if let Some(value) = settings.get("syslog_addr").map(|text| text.unquote().raw()) {
-        cfg.syslog_addr = value.to_owned();
-    }
-    if let Some(value) = settings
-        .get("syslog_hostname")
-        .map(|text| text.unquote().raw())
-    {
-        cfg.syslog_hostname = value.to_owned();
-    }
-    if let Some(value) = settings
-        .get("syslog_app_name")
-        .map(|text| text.unquote().raw())
-    {
-        cfg.syslog_app_name = value.to_owned();
-    }
-    if let Some(value) = settings.get("syslog_dns_enabled") {
-        cfg.syslog_dns_enabled = strict_bool(value.unquote().raw()).ok_or_else(|| {
-            scalar_error(
-                *value,
-                "invalid-config-value",
-                "global.syslog_dns_enabled",
-                "expected true/false, yes/no, 1/0 or on/off",
-            )
-        })?;
-    }
-    if let Some(value) = settings.get("syslog_cee_enabled") {
-        cfg.syslog_cee_enabled = strict_bool(value.unquote().raw()).ok_or_else(|| {
-            scalar_error(
-                *value,
-                "invalid-config-value",
-                "global.syslog_cee_enabled",
-                "expected true/false, yes/no, 1/0 or on/off",
-            )
-        })?;
-    }
-    for (key, path) in [
-        ("syslog_dns_template", "global.syslog_dns_template"),
-        ("syslog_dns_json", "global.syslog_dns_json"),
-    ] {
-        if let Some(value) = settings.get(key) {
-            return Err(scalar_error(
-                *value,
-                "removed-config-setting",
-                path,
-                "DNS syslog uses a fixed JSON schema; remove this formatting setting",
-            )
-            .into());
-        }
-    }
     if settings.contains_key("disable_waiting_network") {
         cfg.disable_waiting_network = bool_value(
             &settings,
@@ -560,6 +505,28 @@ pub(super) fn parse_global_section(
         .map(|text| text.unquote().raw())
     {
         cfg.bandwidth_max_rx = value.to_owned();
+    }
+    if let Some(text) = settings.get("relay_buf_size") {
+        let value = text.unquote().raw();
+        match crate::tuning::parse_size(value) {
+            Some(bytes) => {
+                if !crate::tuning::relay_buf_size_in_range(bytes) {
+                    scalar_warning(
+                        *text,
+                        diagnostics,
+                        "global.relay_buf_size",
+                        "size is outside the supported relay buffer range; the runtime clamps it",
+                    );
+                }
+                cfg.relay_buf_size = value.to_owned();
+            }
+            None => scalar_warning(
+                *text,
+                diagnostics,
+                "global.relay_buf_size",
+                "size is not a byte count (`65535`, `512KiB`, `1MiB`); keeping the default (65535)",
+            ),
+        }
     }
     if let Some(text) = settings.get("udp_warm_node_count") {
         let value = text.unquote().raw();

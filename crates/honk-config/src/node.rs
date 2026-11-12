@@ -2,7 +2,6 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
-mod headers;
 mod protocol;
 mod validation;
 mod vless;
@@ -69,6 +68,14 @@ pub struct Node {
     pub host: String,
     pub port: u16,
     pub outbound: OutboundConfig,
+    /// Name of the node or group this node dials *through* before reaching
+    /// its own server, or `direct` for no detour at all. Empty means what it
+    /// has always meant: dial the server on the direct path out.
+    ///
+    /// It is a property of the path, not of the protocol, so it lives on the
+    /// node rather than inside [`OutboundConfig`]: every protocol reaches its
+    /// server the same way, and only the server address differs.
+    pub detour: Option<String>,
     pub mark: Option<u32>,
     pub tags: Vec<String>,
     pub subscription_id: Option<uuid::Uuid>,
@@ -90,6 +97,7 @@ impl Default for Node {
             host: String::new(),
             port: 0,
             outbound: OutboundConfig::default(),
+            detour: None,
             mark: None,
             tags: Vec::new(),
             subscription_id: None,
@@ -105,15 +113,27 @@ impl Node {
         self.outbound.protocol()
     }
 
+    /// The detour this node dials through, if it names one. An empty string
+    /// counts as none: generators emit `dialer-proxy: ""` routinely, and
+    /// empty is not a node name anywhere else in the configuration.
+    pub fn detour_name(&self) -> Option<&str> {
+        self.detour
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
     pub fn is_xhttp(&self) -> bool {
         self.transport()
             .is_some_and(StreamTransportOptions::is_xhttp)
     }
 
-    /// Canonicalize stream transports at every adapter boundary before
-    /// deriving identity.
-    pub fn normalize_stream_transport(&mut self) -> Result<(), (&'static str, &'static str)> {
-        if let Some(transport) = self.transport_mut() {
+    /// Canonicalize XHTTP at every adapter boundary before deriving identity.
+    pub fn normalize_stream_transport(&mut self) -> Result<(), &'static str> {
+        if let Some(transport) = self.transport_mut()
+            && (crate::options::vocab::xhttp_stream_transport(&transport.transport) == Ok("xhttp")
+                || transport.xhttp.is_some())
+        {
             transport.normalize()?;
         }
         if self.is_xhttp() {
@@ -122,8 +142,7 @@ impl Node {
             if tls.alpn.is_empty() {
                 tls.alpn.push("h2".into());
             }
-            tls.check_xhttp_alpn()
-                .map_err(|message| ("tls_alpn", message))?;
+            tls.check_xhttp_alpn()?;
         }
         Ok(())
     }
@@ -287,6 +306,14 @@ impl Node {
         }
     }
 
+    pub fn masque(&self) -> Option<&MasqueConfig> {
+        self.outbound.masque()
+    }
+
+    pub fn masque_mut(&mut self) -> Option<&mut MasqueConfig> {
+        self.outbound.masque_mut()
+    }
+
     pub fn tls(&self) -> Option<&TlsOptions> {
         self.outbound.tls()
     }
@@ -324,12 +351,38 @@ impl Node {
     pub fn derive_id(&self) -> uuid::Uuid {
         let material = self.identity_material();
         let legacy_id = uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes());
-        if let Some(tls) = self.tls().filter(|tls| !tls.alpn.is_empty()) {
+        let shaped = if let Some(tls) = self.tls().filter(|tls| !tls.alpn.is_empty()) {
             let alpn = serde_json::to_vec(&("tls-alpn", &tls.alpn))
                 .expect("TLS ALPN strings are JSON serializable");
             uuid::Uuid::new_v5(&legacy_id, &alpn)
         } else {
             legacy_id
+        };
+        // A detour changes the path, not the server: the same server reached
+        // through a different detour is a different node, and both can be
+        // configured at once. Only nodes that name one pay for a new identity,
+        // so every node dialling the direct path keeps the id it has always had.
+        let path_id = match self.detour_name() {
+            Some(detour) => {
+                let material = serde_json::to_vec(&("detour", detour))
+                    .expect("detour names are JSON serializable");
+                uuid::Uuid::new_v5(&shaped, &material)
+            }
+            None => shaped,
+        };
+        // Provenance is part of the identity too. A node written by hand in
+        // config.dae and the identical endpoint imported from a subscription
+        // are two distinct outbounds: without this child UUID they collide on
+        // one ID, and the whole subscription refresh is rejected with
+        // `duplicate-node-id`. The marker is deliberately *not* keyed by the
+        // provider ID, so two subscriptions serving the same endpoint still
+        // share an identity and keep the existing first-publisher-wins rule.
+        // Static nodes keep exactly the ID they always had, so existing group
+        // memberships and saved selections survive unchanged.
+        if self.subscription_id.is_some() {
+            uuid::Uuid::new_v5(&path_id, b"subscription")
+        } else {
+            path_id
         }
     }
 }
@@ -384,6 +437,23 @@ pub struct Group {
     /// Explicit fallback for the caller when the group's policy has no available selection.
     /// Can be "direct", "block", another group name, or a node name.
     pub final_outbound: Option<String>,
+    /// The node or group every member of this group dials out through, or
+    /// `direct`.
+    ///
+    /// Unlike a node's own detour, a group's cannot be bound to anything ahead
+    /// of time: which member carries a flow is decided when the flow arrives.
+    /// The name is therefore resolved on each dial and applied to whichever
+    /// member the group then picks. A group naming none inherits the detour of
+    /// the first nested group in `groups` that has one, because
+    /// `filter: group(X)` borrows X's selection rather than copying a node
+    /// list. An explicit name, including `direct`, stops that walk.
+    ///
+    /// Groups that name no detour serialize exactly as they always have:
+    /// a `"detour": null` on every group would be noise in every written
+    /// configuration and a diff against every one written before this option
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detour: Option<String>,
     /// URL for health checks (overrides global tcp_check_url).
     pub check_url: Option<String>,
     /// Retained interval metadata; runtime checks use the global interval.
@@ -418,6 +488,7 @@ impl Default for Group {
             groups: Vec::new(),
             default: None,
             final_outbound: None,
+            detour: None,
             check_url: None,
             check_interval: None,
             tolerance: default_tolerance(),
@@ -483,6 +554,8 @@ impl<'de> Deserialize<'de> for Group {
             #[serde(default)]
             final_outbound: Option<String>,
             #[serde(default)]
+            detour: Option<String>,
+            #[serde(default)]
             check_url: Option<String>,
             #[serde(default)]
             check_interval: Option<u64>,
@@ -506,6 +579,7 @@ impl<'de> Deserialize<'de> for Group {
             groups: wire.groups,
             default: wire.default,
             final_outbound: wire.final_outbound,
+            detour: wire.detour,
             check_url: wire.check_url,
             check_interval: wire.check_interval,
             tolerance: wire.tolerance.unwrap_or_else(default_tolerance),

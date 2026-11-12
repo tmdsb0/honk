@@ -4,11 +4,11 @@
 
 **用 Rust 编写的实验性 Linux 透明代理引擎。**
 
-**[文档](https://daeuniverse.org/zh-CN/honk/)** / **[网页界面示范](https://demo.daeuniverse.org/)** / **[下载](https://github.com/daeuniverse/honk/releases)**
+**[文档](doc/README.md)** / **[网页界面示范](https://demo.daeuniverse.org/)** / **[下载](https://github.com/6106757-lab/honk/releases)**
 
 [English](README.md) / 简体中文
 
-[功能概览](#功能概览) / [安装](#安装) / [网页界面](#网页界面) / [报告问题](#报告问题)
+[功能概览](#功能概览) / [定制内容](#本-fork-的定制内容) / [安装](#安装) / [网页界面](#网页界面) / [报告问题](#报告问题)
 
 </div>
 
@@ -26,9 +26,22 @@ honk 的 eBPF 数据面和配置语法参考 dae 的设计，出站组与 Clash 
 
 不提供 FakeIP 引擎、完整 mihomo 兼容性或 Windows/macOS 数据面。
 
+## 本 fork 的定制内容
+
+本仓库基于 [daeuniverse/honk](https://github.com/daeuniverse/honk)，额外提供以下功能，配置方法见[链式代理与 MASQUE 配置指南](doc/zh/guide/chained-proxy-and-masque.md)：
+
+- **MASQUE（connect-ip）出站**：可从订阅导入 `type: masque` 节点（含 Cloudflare WARP），以 HTTP/2 或 HTTP/3 承载，支持 TUN 设备与内置界面延迟测试。
+- **链式代理（detour）**：节点可写 `dialer-proxy`（Clash 订阅 / 分享链接）或 `detour`（sing-box JSON）；组可写 `detour:`，前置可为节点、组或 `direct`。
+- **引用组继承**：`filter: group(X)` 的组自动继承上游组的 detour，显式 `detour:`（含 `direct`）可覆盖；TCP、UDP 拨号与 Clash / 原生 API 延迟测试共用同一解析。
+- **前置热切换**：切换前置节点或前置组成员后热重载即生效，无需重启；MASQUE 隧道按承载路径分别建立，空闲隧道在重载时回收。
+- **内置定制版 doona 界面**：`full` 构建内置 [6106757-lab/doona](https://github.com/6106757-lab/doona) `v0.1.0-rc.4` 编译的界面，支持 MASQUE 延迟测试。
+- **现成二进制**：[Releases](https://github.com/6106757-lab/honk/releases) 提供已编译的 x86_64 musl `full` 构建，下载即可部署，不需要本地 Rust 编译环境。
+
+上游 `main` 目前不含上述功能；本仓库独立维护，问题请提交到[本仓库 Issues](https://github.com/6106757-lab/honk/issues)。
+
 ## 安装
 
-从 [Releases](https://github.com/daeuniverse/honk/releases) 下载适合目标平台的归档。发布物支持 x86_64 与 aarch64 Linux，一般用途建议选择 `full`。
+从 [本仓库 Releases](https://github.com/6106757-lab/honk/releases) 下载已编译好的归档。当前发布物为 x86_64 Linux 静态 musl 的 `full` 构建（原生 API + Clash API + 内置 doona / doona lite），下载后可直接部署，不需要本地 Rust 编译环境。下表描述上游的构建矩阵，本仓库 Release 目前只发布 `full`。
 
 | 构建 | 原生 API | Clash API | 内嵌 doona 与 doona lite |
 | --- | --- | --- | --- |
@@ -38,7 +51,7 @@ honk 的 eBPF 数据面和配置语法参考 dae 的设计，出站组与 Clash 
 
 各构建均提供静态链接的 musl 版本，`full` 另提供链接 glibc 的 `gnu` 版本。名称含 `stock` 的归档使用系统分配器而非 jemalloc。每个版本的 Downloads 一节列出校验和及构建来源证明。
 
-Debian、Ubuntu、Fedora、openSUSE 和 Arch Linux 的软件包安装见[安装指南](https://daeuniverse.org/zh-CN/honk/installation/)。OpenWrt 用户可使用 [daeuniverse 软件源](https://daeuniverse.org/zh-CN/openwrt/)。
+OpenWrt 用户可使用 [daeuniverse 软件源](https://openwrt.daeuniverse.org/zh-cn/)。
 
 自行编译请按[从源码构建](doc/zh/how-to-start.md#从源码构建)准备。发布二进制内嵌 eBPF；仅执行 `cargo build --release` 不会启用真实数据面。
 
@@ -48,14 +61,14 @@ Debian、Ubuntu、Fedora、openSUSE 和 Arch Linux 的软件包安装见[安装�
 
 honk 可配合以下两类网页界面使用：
 
-- [doona](https://github.com/Zakkaus/doona)：基于原生 API，提供运行观测、诊断与配置编辑功能。doona lite 为其轻量预览版。在线演示见[标准版](https://demo.daeuniverse.org/)与 [lite 版](https://demo.daeuniverse.org/lite/)。
+- [doona](https://github.com/Zakkaus/doona)：基于原生 API，提供运行观测、诊断与配置编辑功能。doona lite 为其轻量预览版。在线演示见[标准版](https://demo.daeuniverse.org/)与 [lite 版](https://demo.daeuniverse.org/lite/)。本仓库 `full` 构建内置的是 [6106757-lab/doona](https://github.com/6106757-lab/doona) `v0.1.0-rc.4` 编译的界面，支持对 MASQUE 节点做延迟测试。
 - Clash 面板：基于 Clash 兼容 API，例如 [zashboard](https://github.com/Zephyruso/zashboard)。
 
-![doona 活动页的流量图表与状态卡片](https://daeuniverse.org/doona/screenshots/zh-CN/activity-light.webp)
+![doona 活动页的流量图表与状态卡片](https://doona.daeuniverse.org/screenshots/zh-CN/activity-light.webp)
 
-![doona lite 节点页](https://daeuniverse.org/doona/images/lite-nodes-light.webp)
+![doona lite 节点页](https://doona.daeuniverse.org/images/lite-nodes-light.webp)
 
-使用 `full` 构建时，在 `experimental.native_api` 中将 `ui` 设为 `'embedded'` 即可启用 doona，设为 `'embedded-lite'` 则启用 doona lite。`native-api` 构建可将 `ui` 设为另行[安装的 doona](https://daeuniverse.org/zh-CN/doona/install) 所在目录。配置步骤见 [doona 快速入门](https://daeuniverse.org/zh-CN/doona/quick-start)。启用 Clash 面板需配置 `experimental.clash_api`，honk 首次启动时自动下载 zashboard。各设置项的说明见 [experimental 设置](doc/zh/reference/experimental.md)。
+使用 `full` 构建时，在 `experimental.native_api` 中将 `ui` 设为 `'embedded'` 即可启用 doona，设为 `'embedded-lite'` 则启用 doona lite。`native-api` 构建可将 `ui` 设为另行[安装的 doona](https://doona.daeuniverse.org/zh-CN/install.html) 所在目录。配置步骤见 [doona 快速入门](https://doona.daeuniverse.org/zh-CN/quick-start.html)。启用 Clash 面板需配置 `experimental.clash_api`，honk 首次启动时自动下载 zashboard。各设置项的说明见 [experimental 设置](doc/zh/reference/experimental.md)。
 
 ## 文档
 
@@ -74,11 +87,11 @@ honk 可配合以下两类网页界面使用：
 
 无 root 的用户态开发可使用 [mock 模式](doc/zh/how-to-start.md#无-root-开发)。`--mock-ebpf` 不会拦截流量，不能代替数据面测试。
 
-滚动的 [Debug 预发布](https://github.com/daeuniverse/honk/releases/tag/debug)提供来自 `main` 的最新 `debug.*` 测试构建。它们使用 release profile，并非 Cargo debug profile；保留期限与发布流程见[发布规则](.agents/rules/release.md)。
+本仓库的二进制由 GitHub Actions 构建，产物直接发布到 [Releases](https://github.com/6106757-lab/honk/releases)，无需本地编译环境；构建工作流见 [build.yml](.github/workflows/build.yml)，发布校验和随每个 Release 提供。
 
 ## 报告问题
 
-代理、路由和 DNS 问题请提交至 [honk issues](https://github.com/daeuniverse/honk/issues)；网页界面问题请提交至 [doona issues](https://github.com/Zakkaus/doona/issues)。
+代理、路由和 DNS 问题请提交至 [本仓库 Issues](https://github.com/6106757-lab/honk/issues)；内置界面问题请提交至 [doona fork Issues](https://github.com/6106757-lab/doona/issues)。上游专属功能的问题仍应提到 daeuniverse/honk。
 
 安全漏洞请按 [SECURITY.md](.github/SECURITY.md) 报告。
 

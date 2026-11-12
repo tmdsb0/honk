@@ -4,6 +4,7 @@ pub(crate) use seed::CONFIG_FIELDS;
 pub use seed::ConfigSeed;
 use seed::RawConfigSeed;
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use crate::diagnostic::{
@@ -19,6 +20,7 @@ use crate::ConfigDiagnostic;
 use crate::dns::DnsConfig;
 use crate::experimental::ExperimentalConfig;
 use crate::group::Group;
+use crate::listener::ListenerConfig;
 use crate::node::Node;
 use crate::routing::RoutingConfig;
 use crate::subscription::Subscription;
@@ -54,6 +56,11 @@ pub struct Config {
     pub experimental: ExperimentalConfig,
     #[serde(default)]
     pub assets: crate::assets::AssetsConfig,
+    /// Named mixed (HTTP + SOCKS5) inbound listeners. Empty by default, so
+    /// existing configurations keep a completely unchanged code path.
+    /// Outbound selection is done by `inbound(name)` routing rules.
+    #[serde(default)]
+    pub listeners: Vec<ListenerConfig>,
 }
 
 /// Global configuration matching dae `global { ... }` section.
@@ -75,31 +82,6 @@ pub struct GlobalConfig {
     /// [`GlobalConfig::data_dir`]; empty keeps file logging disabled.
     #[serde(default)]
     pub log_file: String,
-    #[serde(default)]
-    pub syslog_addr: String,
-    #[serde(default)]
-    pub syslog_dns_enabled: bool,
-    #[serde(default)]
-    pub syslog_cee_enabled: bool,
-    /// Reject removed formatting controls in structured configuration.
-    #[doc(hidden)]
-    #[serde(
-        default,
-        skip_serializing,
-        deserialize_with = "removed_dns_syslog_format"
-    )]
-    pub syslog_dns_template: (),
-    #[doc(hidden)]
-    #[serde(
-        default,
-        skip_serializing,
-        deserialize_with = "removed_dns_syslog_format"
-    )]
-    pub syslog_dns_json: (),
-    #[serde(default)]
-    pub syslog_hostname: String,
-    #[serde(default = "default_syslog_app_name")]
-    pub syslog_app_name: String,
     #[serde(default)]
     pub disable_waiting_network: bool,
     /// Give accepted connections up to five seconds to finish on ordinary shutdown.
@@ -158,6 +140,15 @@ pub struct GlobalConfig {
     pub bandwidth_max_tx: String,
     #[serde(default)]
     pub bandwidth_max_rx: String,
+    /// Buffer used by the userspace copy relay, the WebSocket bridge and the
+    /// splice pipe, e.g. `'65535'` or `'1MiB'`.
+    ///
+    /// The copy relay is serial, so its chunk is capped at one protocol frame
+    /// (`65535`) and raising the value cannot lift throughput there. The
+    /// WebSocket duplex and the splice pipe do keep this many bytes in flight
+    /// and do scale with it, up to about one bandwidth-delay product.
+    #[serde(default = "default_relay_buf_size")]
+    pub relay_buf_size: String,
     #[serde(default = "default_udphop_interval_secs")]
     pub udphop_interval_secs: u64,
     /// Timeout for TCP connect (SYN/SYN-ACK) in milliseconds.
@@ -331,19 +322,6 @@ fn default_tproxy_mark() -> u32 {
 /// compiled in, so userspace cannot honor any other value. honk-core pins
 /// this against `honk_ebpf_common::TPROXY_MARK` with a unit test.
 pub const DEFAULT_TPROXY_MARK: u32 = 0x0800_0000;
-fn default_syslog_app_name() -> String {
-    "honk".into()
-}
-
-fn removed_dns_syslog_format<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<(), D::Error> {
-    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
-    Err(serde::de::Error::custom(
-        "DNS syslog uses a fixed JSON schema; remove this formatting setting",
-    ))
-}
-
 fn default_log_level() -> String {
     "info".into()
 }
@@ -380,6 +358,11 @@ fn default_utls_imitate() -> String {
 }
 fn default_fallback_resolver() -> String {
     "8.8.8.8:53".into()
+}
+fn default_relay_buf_size() -> String {
+    // One protocol frame. A larger copy chunk cannot raise throughput (the
+    // relay loop is serial) and gets split by the framed outbounds anyway.
+    u16::MAX.to_string()
 }
 fn default_udphop_interval_secs() -> u64 {
     30
@@ -419,13 +402,6 @@ impl Default for GlobalConfig {
             so_mark_from_dae: 0,
             log_level: default_log_level(),
             log_file: String::new(),
-            syslog_addr: String::new(),
-            syslog_dns_enabled: false,
-            syslog_cee_enabled: false,
-            syslog_dns_template: (),
-            syslog_dns_json: (),
-            syslog_hostname: String::new(),
-            syslog_app_name: default_syslog_app_name(),
             disable_waiting_network: false,
             shutdown_wait_connections: false,
             lan_interface: vec![],
@@ -452,6 +428,7 @@ impl Default for GlobalConfig {
             fallback_resolver: default_fallback_resolver(),
             bandwidth_max_tx: String::new(),
             bandwidth_max_rx: String::new(),
+            relay_buf_size: default_relay_buf_size(),
             udphop_interval_secs: default_udphop_interval_secs(),
             connect_timeout_ms: default_connect_timeout_ms(),
             dns_resolve_timeout_ms: default_dns_resolve_timeout_ms(),
@@ -476,6 +453,65 @@ fn config_validation_error(
         setting,
         message,
     )
+}
+
+/// Walk one detour chain and report the first name that closes a loop.
+///
+/// `settled` remembers chains that ended without a cycle, so a detour shared
+/// by several nodes is walked once no matter how many of them name it.
+fn detour_cycle(
+    nodes: &[Node],
+    groups: &[Group],
+    name: &str,
+    path: &mut Vec<String>,
+    settled: &mut HashSet<String>,
+) -> Option<String> {
+    if path.iter().any(|seen| seen == name) {
+        return Some(name.to_string());
+    }
+    if settled.contains(name) {
+        return None;
+    }
+    path.push(name.to_string());
+    // A group reached this way carries whatever its own detour names, so the
+    // chain continues through it exactly as it would through a member.
+    let target = groups
+        .iter()
+        .find(|group| group.name == name)
+        .and_then(|group| group.detour.as_deref())
+        .or_else(|| {
+            nodes
+                .iter()
+                .find(|node| node.name == name)
+                .and_then(Node::detour_name)
+        });
+    if let Some(target) = target {
+        if matches!(target, Config::BUILTIN_DIRECT_NODE) {
+            settled.insert(name.to_string());
+        } else if let Some(group) = groups.iter().find(|group| group.name == target) {
+            // A group detour leads wherever the group can lead: its nested
+            // groups, its fallback, and its own detour. Members only a filter
+            // expression names need the resolver, which is where the group
+            // breaks its cycles.
+            for member in group
+                .groups
+                .iter()
+                .chain(group.final_outbound.iter())
+                .chain(group.detour.iter())
+            {
+                if let Some(cycle) = detour_cycle(nodes, groups, member, path, settled) {
+                    return Some(cycle);
+                }
+            }
+            settled.insert(name.to_string());
+        } else if let Some(cycle) = detour_cycle(nodes, groups, target, path, settled) {
+            return Some(cycle);
+        } else {
+            settled.insert(name.to_string());
+        }
+    }
+    path.pop();
+    None
 }
 
 impl Config {
@@ -812,52 +848,6 @@ impl Config {
 
     fn validate_globals_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
         self.experimental.native_api.validate_detailed(source)?;
-        if self.global.syslog_dns_enabled
-            && !self
-                .global
-                .syslog_addr
-                .parse::<std::net::SocketAddr>()
-                .is_ok_and(|address| {
-                    let ip = address.ip().to_canonical();
-                    address.port() != 0
-                        && !ip.is_unspecified()
-                        && !ip.is_multicast()
-                        && !matches!(ip, std::net::IpAddr::V4(ip) if ip.is_broadcast())
-                })
-        {
-            return Err(config_validation_error(
-                source,
-                SettingPath::new("global").field("syslog_addr"),
-                "invalid-config-value",
-                "DNS syslog requires a unicast IP address and nonzero port",
-            ));
-        }
-
-        for (value, limit, field, auto) in [
-            (
-                self.global.syslog_hostname.as_str(),
-                255,
-                "syslog_hostname",
-                true,
-            ),
-            (
-                self.global.syslog_app_name.as_str(),
-                48,
-                "syslog_app_name",
-                false,
-            ),
-        ] {
-            if !(auto && value.is_empty()) && !crate::check::valid_syslog_header_field(value, limit)
-            {
-                return Err(config_validation_error(
-                    source,
-                    SettingPath::new("global").field(field),
-                    "invalid-config-value",
-                    "syslog header fields require printable ASCII without spaces and must fit their RFC 5424 byte limits",
-                ));
-            }
-        }
-
         if let Err(mut error) = crate::check::validate_dns_check_targets(&self.global.udp_check_dns)
         {
             error.diagnostic.source = source.clone();
@@ -898,7 +888,6 @@ impl Config {
             ));
         }
         self.dns.validate_upstream_references_detailed(source)?;
-        self.dns.validate_node_host_rules_detailed(source)?;
         if self.global.check_interval_secs == 0 {
             return Err(config_validation_error(
                 source,
@@ -1049,6 +1038,7 @@ impl Config {
         };
         let check_outbound = |target: &str, index: Option<usize>| {
             if matches!(target, Self::BUILTIN_DIRECT_NODE | Self::BUILTIN_BLOCK_NODE)
+                || target.eq_ignore_ascii_case("follow")
                 || self.groups.iter().any(|group| group.name == target)
             {
                 return Ok(());
@@ -1076,6 +1066,8 @@ impl Config {
             check_outbound(rule.outbound.as_str(), Some(index))?;
         }
         check_outbound(&self.routing.default_outbound, None)?;
+        self.validate_node_detours_detailed(source)?;
+        self.validate_group_detours_detailed(source)?;
         for (index, subscription) in self.subscriptions.iter().enumerate() {
             if subscription.name.is_empty() {
                 return Err(config_validation_error(
@@ -1122,6 +1114,149 @@ impl Config {
         Ok(())
     }
 
+    /// Validate every node's detour, and the graph those detours form.
+    ///
+    /// A detour names the node, group or builtin this node dials through, and
+    /// it is applied once — at the shared dial entry point — so a chain that
+    /// leads back to a node already on the path would dial that node through
+    /// itself. Group members only a filter expression names are resolved at
+    /// runtime, where the group already breaks its own cycles.
+    fn validate_node_detours_detailed(
+        &self,
+        source: &SourceRef,
+    ) -> Result<(), DetailedConfigError> {
+        let is_node = |name: &str| {
+            self.nodes.iter().any(|node| {
+                node.id != DIRECT_NODE_ID && node.id != BLOCK_NODE_ID && node.name == name
+            })
+        };
+        // A subscription's nodes join the configuration only when its provider
+        // expands, so a detour naming one cannot resolve while the operator
+        // sources parse. The dial resolves the name against the assembled
+        // outbounds at runtime, so with a subscription declared an unplaceable
+        // target is left to that pass instead of failing the whole source.
+        let deferred = !self.subscriptions.is_empty();
+        for (index, node) in self.nodes.iter().enumerate() {
+            let Some(target) = node.detour_name() else {
+                continue;
+            };
+            if target == node.name {
+                return Err(config_validation_error(
+                    source,
+                    SettingPath::new("nodes").index(index + 1).field("detour"),
+                    "invalid-node-detour-target",
+                    "node detour must not name the node itself",
+                ));
+            }
+            if deferred
+                || matches!(target, Self::BUILTIN_DIRECT_NODE)
+                || is_node(target)
+                || self.groups.iter().any(|group| group.name == target)
+            {
+                continue;
+            }
+            return Err(config_validation_error(
+                source,
+                SettingPath::new("nodes").index(index + 1).field("detour"),
+                "invalid-node-detour-target",
+                "node detour must name a node, a group or direct",
+            ));
+        }
+        let mut path = Vec::new();
+        let mut settled = HashSet::new();
+        for node in &self.nodes {
+            if !is_node(&node.name) || node.detour_name().is_none() {
+                continue;
+            }
+            if detour_cycle(
+                &self.nodes,
+                &self.groups,
+                &node.name,
+                &mut path,
+                &mut settled,
+            )
+            .is_some()
+            {
+                return Err(config_validation_error(
+                    source,
+                    SettingPath::new("nodes").field("detour"),
+                    "invalid-node-detour-cycle",
+                    "node detours must not form a cycle",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// A group's detour is a name with the same rules a node's has: it must
+    /// exist, and it must not be the group itself.
+    ///
+    /// The cycle walk starts from the group, because a group's detour is a hop
+    /// in its own right and not merely a property of whichever member it picks.
+    fn validate_group_detours_detailed(
+        &self,
+        source: &SourceRef,
+    ) -> Result<(), DetailedConfigError> {
+        let is_node = |name: &str| {
+            self.nodes.iter().any(|node| {
+                node.id != DIRECT_NODE_ID && node.id != BLOCK_NODE_ID && node.name == name
+            })
+        };
+        // As with a node's detour, a subscription can name the target only once
+        // its provider expands; the dial resolves it at runtime.
+        let deferred = !self.subscriptions.is_empty();
+        for (index, group) in self.groups.iter().enumerate() {
+            let Some(target) = group.detour.as_deref() else {
+                continue;
+            };
+            if target == group.name {
+                return Err(config_validation_error(
+                    source,
+                    SettingPath::new("groups").index(index + 1).field("detour"),
+                    "invalid-group-detour-target",
+                    "group detour must not name the group itself",
+                ));
+            }
+            if deferred
+                || matches!(target, Self::BUILTIN_DIRECT_NODE)
+                || is_node(target)
+                || self.groups.iter().any(|other| other.name == target)
+            {
+                continue;
+            }
+            return Err(config_validation_error(
+                source,
+                SettingPath::new("groups").index(index + 1).field("detour"),
+                "invalid-group-detour-target",
+                "group detour must name a node, a group or direct",
+            ));
+        }
+        let mut path = Vec::new();
+        let mut settled = HashSet::new();
+        for group in &self.groups {
+            if group.detour.is_none() {
+                continue;
+            }
+            if detour_cycle(
+                &self.nodes,
+                &self.groups,
+                &group.name,
+                &mut path,
+                &mut settled,
+            )
+            .is_some()
+            {
+                return Err(config_validation_error(
+                    source,
+                    SettingPath::new("groups").field("detour"),
+                    "invalid-group-detour-cycle",
+                    "group detours must not form a cycle",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Validate operator configuration through the legacy error API.
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
         self.validate_detailed()
@@ -1135,6 +1270,20 @@ impl Config {
         crate::node::validate_node_collection(&self.nodes)?;
         self.validate_reserved_names_detailed(&source)?;
         self.validate_references_detailed(&source)
+    }
+
+    /// Validate one entry lifted out of its source.
+    ///
+    /// A fragment parsed on its own carries a single node or subscription and no
+    /// groups or routing, so every reference it makes to another node, group or
+    /// routing target is unresolvable here by construction. Those references are
+    /// checked once the entry joins the source and the assembled snapshot is
+    /// validated, so only the checks that stand on one entry run at this stage.
+    pub fn validate_fragment(&self) -> Result<(), DetailedConfigError> {
+        let source = DiagnosticSources::new(None).root();
+        self.validate_globals_detailed(&source)?;
+        crate::node::validate_node_collection(&self.nodes)?;
+        self.validate_reserved_names_detailed(&source)
     }
     /// Validate a fully assembled runtime snapshot.
     ///
@@ -1158,6 +1307,7 @@ impl Config {
             .collect();
         let target_exists = |target: &str| {
             matches!(target, Self::BUILTIN_DIRECT_NODE | Self::BUILTIN_BLOCK_NODE)
+                || target.eq_ignore_ascii_case("follow")
                 || self.nodes.iter().any(|node| node.name == target)
                 || group_names.contains(target)
         };
@@ -1433,6 +1583,7 @@ fn setting_from_decode_path(path: &serde_path_to_error::Path) -> (SettingPath, O
                         "groups",
                         "default",
                         "final_outbound",
+                        "detour",
                         "check_url",
                         "check_interval",
                         "tolerance",
@@ -1504,7 +1655,6 @@ fn node_schema_field(field: &str) -> Option<&'static str> {
         "network" => "network",
         "ws_path" => "ws_path",
         "ws_host" => "ws_host",
-        "ws_headers" => "ws_headers",
         "grpc_service" => "grpc_service",
         "hy2_auth" => "hy2_auth",
         "hy2_obfs" => "hy2_obfs",
@@ -1948,5 +2098,141 @@ mod builtin_nodes_tests {
         let error = config.validate_detailed().unwrap_err();
         assert_eq!(error.diagnostic.code, "invalid-config-value");
         assert_eq!(error.diagnostic.setting.to_string(), "groups[1].name");
+    }
+}
+
+#[cfg(test)]
+mod node_detour_tests {
+    use super::*;
+
+    /// Each node needs a server of its own. The content-derived identity
+    /// covers protocol, host, port, credentials and dial shape — never the
+    /// name — so two nodes built from one link would share an ID, and
+    /// validation rejects a collection holding the same ID twice.
+    fn detour_node(name: &str, port: u16) -> crate::node::Node {
+        let mut node =
+            crate::node::Node::from_share_link(&format!("trojan://secret@example.com:{port}"))
+                .unwrap();
+        node.name = name.into();
+        node.id = node.derive_id();
+        node
+    }
+
+    /// A group names a front the way a node does. It is resolved to whichever
+    /// member the group then picks, so keeping it is the whole point: a node
+    /// that names a group is carried by it, not dropped onto its own path.
+    #[test]
+    fn a_group_named_detour_survives_alongside_node_and_direct() {
+        let mut config = Config::default();
+        config.ensure_builtin_nodes();
+        config.nodes.push(detour_node("front", 443));
+        let front_id = config.nodes.last().expect("front was just pushed").id;
+        config.groups.push(crate::group::Group {
+            name: "front-group".into(),
+            policy: crate::node::GroupPolicy::Selector,
+            nodes: vec![front_id],
+            ..Default::default()
+        });
+        let mut rides_group = detour_node("rides-group", 444);
+        rides_group.detour = Some("front-group".into());
+        rides_group.id = rides_group.derive_id();
+        let mut rides_node = detour_node("rides-node", 445);
+        rides_node.detour = Some("front".into());
+        rides_node.id = rides_node.derive_id();
+        let mut rides_direct = detour_node("rides-direct", 446);
+        rides_direct.detour = Some("direct".into());
+        rides_direct.id = rides_direct.derive_id();
+        config.nodes.extend([rides_group, rides_node, rides_direct]);
+
+        let detour_of = |name: &str| {
+            config
+                .nodes
+                .iter()
+                .find(|node| node.name == name)
+                .and_then(|node| node.detour_name())
+                .map(str::to_string)
+        };
+        assert_eq!(detour_of("rides-group").as_deref(), Some("front-group"));
+        assert_eq!(detour_of("rides-node").as_deref(), Some("front"));
+        assert_eq!(detour_of("rides-direct").as_deref(), Some("direct"));
+    }
+
+    /// A group's own detour is a hop in its own right, so it cannot be the
+    /// group: nothing would ever be left to carry the flow.
+    #[test]
+    fn a_group_detour_naming_itself_is_rejected() {
+        let mut config = Config::default();
+        config.ensure_builtin_nodes();
+        config.nodes.push(detour_node("front", 443));
+        let front_id = config.nodes.last().expect("front was just pushed").id;
+        config.groups.push(crate::group::Group {
+            name: "wallet".into(),
+            policy: crate::node::GroupPolicy::Selector,
+            nodes: vec![front_id],
+            detour: Some("wallet".into()),
+            ..Default::default()
+        });
+        let error = config
+            .validate()
+            .expect_err("a group cannot carry itself")
+            .to_string();
+        assert!(error.contains("detour"), "{error}");
+    }
+
+    /// Two groups carrying each other never reach a node.
+    #[test]
+    fn a_cycle_of_group_detours_is_rejected() {
+        let mut config = Config::default();
+        config.ensure_builtin_nodes();
+        config.nodes.push(detour_node("front", 443));
+        let front_id = config.nodes.last().expect("front was just pushed").id;
+        for (name, detour) in [("left", "right"), ("right", "left")] {
+            config.groups.push(crate::group::Group {
+                name: name.into(),
+                policy: crate::node::GroupPolicy::Selector,
+                nodes: vec![front_id],
+                detour: Some(detour.into()),
+                ..Default::default()
+            });
+        }
+        let error = config
+            .validate()
+            .expect_err("two groups carrying each other is a cycle")
+            .to_string();
+        assert!(error.contains("cycle"), "{error}");
+    }
+
+    /// A group detour is a valid configuration, not a tolerated one.
+    #[test]
+    fn a_group_named_detour_validates() {
+        let mut config = Config::default();
+        config.ensure_builtin_nodes();
+        config.nodes.push(detour_node("front", 443));
+        let front_id = config.nodes.last().expect("front was just pushed").id;
+        config.groups.push(crate::group::Group {
+            name: "front-group".into(),
+            policy: crate::node::GroupPolicy::Selector,
+            nodes: vec![front_id],
+            ..Default::default()
+        });
+        let mut rides_group = detour_node("rides-group", 444);
+        rides_group.detour = Some("front-group".into());
+        rides_group.id = rides_group.derive_id();
+        config.nodes.push(rides_group);
+
+        // Say what failed: a minimal configuration can only be checked once
+        // the reason is in front of you.
+        if let Err(error) = config.validate() {
+            panic!("a group detour must not fail the configuration: {error:#}");
+        }
+        assert_eq!(
+            config
+                .nodes
+                .last()
+                .expect("rides-group was just pushed")
+                .detour_name(),
+            Some("front-group"),
+            "the group detour must reach the dial path"
+        );
     }
 }

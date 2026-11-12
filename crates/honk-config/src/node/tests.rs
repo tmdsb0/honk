@@ -50,11 +50,6 @@ fn test_group_policy_serde_rejects_legacy_honk() {
 fn test_protocol_identity_goldens() {
     let cases = [
         (
-            "vless-ws",
-            "vless://00000000-0000-4000-8000-000000000001@ws.example:443?type=ws&path=%2Fws#ws",
-            "ff344bcb-482a-5b1d-b435-f75734608c61",
-        ),
-        (
             "ss",
             "ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388#ss",
             "e4a92538-53a2-5f83-85cd-b5d11f90361b",
@@ -106,6 +101,31 @@ fn test_protocol_identity_goldens() {
         }
         assert_eq!(node.derive_id().to_string(), expected, "{name}");
     }
+}
+
+#[test]
+fn test_identity_separates_static_and_subscription_copies() {
+    // The same endpoint written by hand in config.dae and imported from a
+    // subscription are two distinct outbounds. Without this split they share
+    // one content-derived ID and the whole subscription refresh is rejected
+    // with `duplicate-node-id`.
+    let static_node = Node::from_share_link("socks5://user:pass@1.2.3.4:1080#edge").unwrap();
+    let static_id = static_node.derive_id();
+    assert_eq!(static_node.id, static_id, "static IDs stay unchanged");
+
+    let mut from_a = static_node.clone();
+    from_a.subscription_id = Some(uuid::Uuid::new_v4());
+    from_a.id = from_a.derive_id();
+    assert_ne!(from_a.id, static_id, "a subscription copy needs its own ID");
+
+    // Provenance is a fixed namespace, not the provider UUID: two providers
+    // serving the same endpoint still share one identity, preserving the
+    // existing first-publisher-wins rule for cross-provider duplicates.
+    let mut from_b = static_node.clone();
+    from_b.subscription_id = Some(uuid::Uuid::new_v4());
+    assert_eq!(from_b.derive_id(), from_a.id);
+
+    validate_node_collection(&[static_node, from_a]).expect("both copies can coexist");
 }
 
 #[test]
@@ -333,95 +353,6 @@ fn test_derive_id_is_content_derived() {
     assert_eq!(node.derive_id(), other_insecure.derive_id());
 }
 
-fn ws_candidate(headers: &[(&str, &str)]) -> Node {
-    let mut node = Node::from_share_link(
-        "vless://00000000-0000-4000-8000-000000000001@ws.example:443?type=ws&path=%2Fws#ws",
-    )
-    .unwrap();
-    let transport = node.transport_mut().unwrap();
-    for (name, value) in headers {
-        transport.ws_headers.insert((*name).into(), (*value).into());
-    }
-    node
-}
-
-fn ws_normalized(headers: &[(&str, &str)]) -> Node {
-    let mut node = ws_candidate(headers);
-    node.normalize_stream_transport().unwrap();
-    node.validate_protocol().unwrap();
-    node
-}
-
-#[test]
-fn test_ws_headers_participate_in_identity() {
-    let plain = ws_normalized(&[]);
-    let with_ua = ws_normalized(&[("User-Agent", "Mozilla/5.0")]);
-    assert_eq!(
-        with_ua.transport().unwrap().ws_headers["user-agent"],
-        "Mozilla/5.0"
-    );
-    assert_ne!(plain.derive_id(), with_ua.derive_id());
-
-    // Names are case-insensitive: equal-value aliases collapse and do not
-    // change identity; differing values conflict.
-    assert_eq!(
-        ws_normalized(&[("user-agent", "Mozilla/5.0"), ("User-Agent", "Mozilla/5.0")]).derive_id(),
-        with_ua.derive_id()
-    );
-    assert_ne!(
-        ws_normalized(&[("user-agent", "curl/8")]).derive_id(),
-        with_ua.derive_id()
-    );
-    let mut conflicting = ws_candidate(&[("User-Agent", "one"), ("user-agent", "two")]);
-    assert!(conflicting.normalize_stream_transport().is_err());
-}
-
-#[test]
-fn test_ws_header_admission_bounds_and_reserved_names() {
-    for (name, value) in [
-        ("host", "cdn.example"),
-        ("Connection", "keep-alive"),
-        ("upgrade", "websocket"),
-        ("sec-websocket-version", "13"),
-        ("sec-websocket-extensions", ""),
-        ("sec-websocket-accept", ""),
-        ("content-length", "0"),
-        ("transfer-encoding", "chunked"),
-        ("sec-websocket-key", "x"),
-        ("sec-websocket-protocol", "v2ray"),
-        ("bad name", "x"),
-        ("x-test", "\r\n"),
-        ("x-test", "\t"),
-        ("x-test", "\0"),
-        ("x-test", "\u{7f}"),
-    ] {
-        let mut candidate = ws_candidate(&[(name, value)]);
-        assert!(
-            candidate.normalize_stream_transport().is_err(),
-            "{name} must be rejected"
-        );
-    }
-    for name in ["origin", "cookie", "x-cdn-token"] {
-        let mut candidate = ws_candidate(&[(name, "value")]);
-        assert!(candidate.normalize_stream_transport().is_ok(), "{name}");
-    }
-
-    let mut noncanonical = ws_candidate(&[("User-Agent", "value")]);
-    assert!(noncanonical.validate_protocol().is_err());
-    noncanonical.normalize_stream_transport().unwrap();
-    assert!(noncanonical.validate_protocol().is_ok());
-    noncanonical.transport_mut().unwrap().ws_headers = (0..65)
-        .map(|index| (format!("x-{index}"), "v".into()))
-        .collect();
-    assert!(noncanonical.validate_protocol().is_err());
-
-    let mut grpc = ws_candidate(&[("user-agent", "Mozilla/5.0")]);
-    let transport = grpc.transport_mut().unwrap();
-    transport.transport = "grpc".into();
-    transport.grpc_service = Some("service".into());
-    assert!(grpc.normalize_stream_transport().is_err());
-}
-
 #[test]
 fn test_tls_alpn_identity_is_ordered_and_framed() {
     let legacy = Node::from_share_link("anytls://secret@example.com:443#anytls").unwrap();
@@ -539,4 +470,54 @@ fn test_validate_redacts_vless_path_context_name() {
     let error = node.validate().unwrap_err();
     let rendered = format!("{error} {error:?}");
     assert!(!rendered.contains(CANARY), "{rendered}");
+}
+
+/// A link written into a configuration spells its detour the same way a
+/// subscription's does, so the two agree on what a node rides out through.
+#[test]
+fn a_share_link_carries_the_detour_it_dials_through() {
+    let node = Node::from_share_link("trojan://secret@example.com:443?dialer-proxy=front").unwrap();
+    assert_eq!(node.detour_name(), Some("front"));
+}
+
+/// Links in the wild disagree on the parameter name; all of them mean the
+/// same thing and none of them is protocol-specific.
+#[test]
+fn every_dialect_of_the_detour_name_is_read() {
+    for key in [
+        "dialer-proxy",
+        "dialer_proxy",
+        "detour",
+        "underlying-proxy",
+        "underlying_proxy",
+    ] {
+        let node =
+            Node::from_share_link(&format!("trojan://secret@example.com:443?{key}=front")).unwrap();
+        assert_eq!(node.detour_name(), Some("front"), "key {key}");
+    }
+}
+
+/// Generators emit an empty value as a matter of course, which is not a node
+/// name anywhere else in the configuration.
+#[test]
+fn a_blank_detour_name_is_no_detour_at_all() {
+    for value in ["", "   "] {
+        let node = Node::from_share_link(&format!(
+            "trojan://secret@example.com:443?dialer-proxy={value}"
+        ))
+        .unwrap();
+        assert_eq!(node.detour_name(), None, "value {value:?}");
+    }
+    let plain = Node::from_share_link("trojan://secret@example.com:443").unwrap();
+    assert_eq!(plain.detour_name(), None);
+}
+
+/// The detour is part of what makes a node the node it is, so the same server
+/// reached two ways is two nodes rather than one with a switch on it.
+#[test]
+fn a_detour_gives_the_node_an_identity_of_its_own() {
+    let direct = Node::from_share_link("trojan://secret@example.com:443").unwrap();
+    let chained =
+        Node::from_share_link("trojan://secret@example.com:443?dialer-proxy=front").unwrap();
+    assert_ne!(direct.derive_id(), chained.derive_id());
 }

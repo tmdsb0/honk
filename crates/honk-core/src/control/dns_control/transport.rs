@@ -17,7 +17,6 @@ impl DnsController {
         client_addr: SocketAddr,
         original_dst: SocketAddr,
         validated: ValidatedDnsQuery,
-        audit: Option<crate::audit::DnsAuditQuery>,
     ) {
         let operation = self.handle_udp_dns_admitted_inner(
             admission,
@@ -25,7 +24,6 @@ impl DnsController {
             client_addr,
             original_dst,
             validated,
-            audit,
         );
         crate::observe::scope_pin!(operation);
         let operation = crate::observe::flows::dns::client_scope(
@@ -44,7 +42,6 @@ impl DnsController {
         client_addr: SocketAddr,
         original_dst: SocketAddr,
         validated: ValidatedDnsQuery,
-        audit: Option<crate::audit::DnsAuditQuery>,
     ) {
         #[cfg(feature = "native-api")]
         let started = std::time::Instant::now();
@@ -57,9 +54,6 @@ impl DnsController {
                 validated.ingress(),
             )
             .await;
-        if let Some(audit) = audit {
-            audit.finish(response.wire(), response.outcome());
-        }
         let delivery = admission
             .run_reply(super::super::send_udp_reply_from_orig_dst(
                 response.wire(),
@@ -163,19 +157,14 @@ impl DnsController {
     ) -> anyhow::Result<()> {
         #[cfg(feature = "native-api")]
         let started = std::time::Instant::now();
-        let audit = self
-            .dns_service
-            .audit
-            .begin(query, IngressProfile::Tcp, client_addr);
+        #[cfg(not(feature = "native-api"))]
+        let _ = client_addr;
         // Each persistent frame gets the current generation independently.
         let admission = match self.try_admit_query(false) {
             Ok(admission) => admission,
             Err(_) => {
                 crate::observe::flows::dns::decision("rejected", Some("admission_refused"));
                 let response = build_dns_refused(query);
-                if let Some(audit) = audit {
-                    audit.finish(&response, None);
-                }
                 let result = write_tcp_dns_response(stream, &response, TCP_DNS_IO_TIMEOUT).await;
                 crate::observe::flows::dns::delivery(
                     if result.is_ok() {
@@ -204,9 +193,6 @@ impl DnsController {
         let response = self
             .answer_query(&admission, query, metadata, IngressProfile::Tcp)
             .await;
-        if let Some(audit) = audit {
-            audit.finish(response.wire(), response.outcome());
-        }
         let result = admission
             .run_reply(write_tcp_dns_response(
                 stream,

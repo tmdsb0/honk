@@ -91,16 +91,15 @@ impl Node {
             );
             emit(diagnostic);
         })?;
-        node.normalize_stream_transport()
-            .map_err(|(field, message)| {
-                DetailedConfigError::new(
-                    ErrorCategory::Validation,
-                    "invalid-config-value",
-                    source.clone(),
-                    SettingPath::new("nodes").field(field),
-                    message,
-                )
-            })?;
+        node.normalize_stream_transport().map_err(|message| {
+            DetailedConfigError::new(
+                ErrorCategory::Validation,
+                "invalid-config-value",
+                source.clone(),
+                SettingPath::new("nodes").field("xhttp"),
+                message,
+            )
+        })?;
         if let Some(config) = node.vless_mut() {
             config.normalize();
         }
@@ -167,6 +166,11 @@ impl Node {
             source,
             emit,
         )?;
+        // The detour names the node this one dials through. It belongs to the
+        // path rather than to the protocol, so it is read last: whichever
+        // dialect the link used, the node now leaves through the same name a
+        // subscription would have given it.
+        node.detour = options::detour(&query).map(ToOwned::to_owned);
         Ok(node)
     }
 }
@@ -192,6 +196,7 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
         "hysteria2" | "hysteria" | "hy2" => OutboundConfig::Hysteria2(Default::default()),
         "tuic" => OutboundConfig::Tuic(Default::default()),
         "juicity" => OutboundConfig::Juicity(Default::default()),
+        "masque" => OutboundConfig::Masque(Default::default()),
         _ => {
             return Err(DetailedConfigError::new(
                 ErrorCategory::UnknownProtocol,
@@ -256,7 +261,12 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
                 config.uuid = single()?;
                 config.encryption = Some("auto".into());
             }
-            OutboundConfig::Shadowsocks(_) | OutboundConfig::Direct | OutboundConfig::Block => {}
+            // MASQUE carries no userinfo credentials; key material arrives as
+            // query parameters handled by the options pass.
+            OutboundConfig::Shadowsocks(_)
+            | OutboundConfig::Masque(_)
+            | OutboundConfig::Direct
+            | OutboundConfig::Block => {}
         }
     }
     Ok(node)

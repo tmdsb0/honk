@@ -8,8 +8,6 @@ use tokio::net::{TcpSocket, TcpStream};
 
 #[cfg(feature = "native-api")]
 mod native_dns;
-#[cfg(feature = "dns-syslog")]
-mod syslog;
 
 struct FixedAddressUpstream {
     address: [u8; 4],

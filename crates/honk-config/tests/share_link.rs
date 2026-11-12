@@ -149,6 +149,7 @@ fn serialization_golden_node() -> Node {
         group_id: Some(uuid::Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap()),
         created_at: "2026-01-02T03:04:05Z".parse().unwrap(),
         updated_at: "2026-02-03T04:05:06Z".parse().unwrap(),
+        detour: None,
     }
 }
 
@@ -667,40 +668,6 @@ vless_mode = "legacy"
     assert!(neutral.get("multiplex").is_none());
     neutral["vless_mode"] = serde_json::Value::Null;
     serde_json::from_value::<Node>(neutral).unwrap();
-}
-
-#[test]
-fn test_ws_headers_survive_flat_wire_formats() {
-    let mut node = Node::from_share_link(
-        "vless://00000000-0000-4000-8000-000000000001@ws.example:443?type=ws&path=%2Fws#ws",
-    )
-    .unwrap();
-    node.transport_mut().unwrap().ws_headers.insert(
-        "User-Agent".into(),
-        "Mozilla/5.0 (X11; Linux x86_64)".into(),
-    );
-    node.normalize_stream_transport().unwrap();
-    node.validate_protocol().unwrap();
-    node.id = node.derive_id();
-    let headers = node.transport().unwrap().ws_headers.clone();
-
-    let json = serde_json::to_value(&node).unwrap();
-    assert_eq!(json["ws_headers"]["user-agent"], headers["user-agent"]);
-    let from_json: Node = serde_json::from_value(json.clone()).unwrap();
-    assert_eq!(from_json.id, node.id);
-    assert_eq!(from_json.transport().unwrap().ws_headers, headers);
-
-    let from_yaml: Node = serde_yaml::from_str(&serde_yaml::to_string(&node).unwrap()).unwrap();
-    let from_toml: Node = toml::from_str(&toml::to_string(&node).unwrap()).unwrap();
-    assert_eq!(from_yaml.transport().unwrap().ws_headers, headers);
-    assert_eq!(from_toml.transport().unwrap().ws_headers, headers);
-    assert_eq!(from_toml.id, node.id);
-
-    // Upgrade headers are rejected on transports that cannot send them.
-    let mut grpc = json;
-    grpc["transport"] = serde_json::json!("grpc");
-    grpc["grpc_service"] = serde_json::json!("service");
-    assert!(serde_json::from_value::<Node>(grpc).is_err());
 }
 
 #[test]
@@ -2603,4 +2570,39 @@ fn detailed_share_link_validation_preserves_intrinsic_cause() {
             .to_string()
             .contains("VLESS flow requires TLS or REALITY")
     );
+}
+
+#[test]
+fn masque_share_link_carries_the_warp_parameters() {
+    let mut diagnostics = Vec::new();
+    let link = "masque://162.159.192.1:443?network=h3&private-key=PRIVATE&public-key=PUBLIC&ip=172.16.0.2%2F32&ipv6=2606%3A4700%3A%3A1%2F128&mtu=1280&remote-dns-resolve=true&dns=1.1.1.1%2C8.8.8.8&sni=www.cloudflare.com";
+    let node = Node::from_share_link_with_detailed_diagnostics(link, &mut diagnostics)
+        .expect("masque link with WARP parameters");
+    let config = node.masque().expect("masque outbound");
+    assert_eq!(
+        config.network.as_deref(),
+        Some("quic"),
+        "h3 selects the QUIC carrier"
+    );
+    assert_eq!(config.private_key.as_deref(), Some("PRIVATE"));
+    assert_eq!(config.endpoint_public_key.as_deref(), Some("PUBLIC"));
+    assert_eq!(config.local_ipv4.as_deref(), Some("172.16.0.2/32"));
+    assert_eq!(config.local_ipv6.as_deref(), Some("2606:4700::1/128"));
+    assert_eq!(config.mtu, Some(1280));
+    assert!(config.remote_dns_resolve);
+    assert_eq!(config.dns, ["1.1.1.1", "8.8.8.8"]);
+    assert!(config.tls.enabled, "a MASQUE tunnel is always TLS");
+    assert_eq!(config.tls.sni.as_deref(), Some("www.cloudflare.com"));
+}
+
+#[test]
+fn masque_share_link_defaults_the_carrier_and_accepts_h2() {
+    let mut diagnostics = Vec::new();
+    let node = Node::from_share_link_with_detailed_diagnostics(
+        "masque://162.159.192.1:443?network=h2",
+        &mut diagnostics,
+    )
+    .expect("masque link over h2");
+    assert_eq!(node.masque().unwrap().network.as_deref(), Some("h2"));
+    assert!(!node.masque().unwrap().remote_dns_resolve);
 }

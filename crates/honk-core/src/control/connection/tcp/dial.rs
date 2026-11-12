@@ -52,6 +52,11 @@ impl ControlPlaneHandle {
         let started_reporters = Arc::new(parking_lot::Mutex::new(Vec::new()));
         for (idx, node) in candidates.iter().enumerate() {
             let ctx = ctx.clone();
+            // The group name the flow came through, which the dial needs to
+            // look up that group's detour. Cloned per candidate because the
+            // async block below moves its capture, and the caller still
+            // attributes the outcome to the same name afterwards.
+            let outbound = outbound.clone();
             let node = (*node).clone();
             let target_domain = target_domain.clone();
             let generation = Arc::clone(&runtime_generation);
@@ -111,6 +116,59 @@ impl ControlPlaneHandle {
                         }
                     };
                     let scope = generation.dial_scope(on_start);
+                    // The detour the flow's group names, if any: it belongs to
+                    // the group rather than to the node, so it is resolved
+                    // here where both are known.
+                    //
+                    // When a candidate was reached through a group's `final:`
+                    // fallback, `outbound` still names the routing group (e.g.
+                    // "Final"), which carries no `detour:` of its own and is not
+                    // linked to the fallback group by a member edge — so looking
+                    // the detour up by `outbound` returns nothing and the front
+                    // is silently dropped. The selection chain records the real
+                    // owning group as its second-to-last element (e.g.
+                    // "Lianshi"); if the routing group resolves to no detour we
+                    // fall back to that owning group, so its `detour:` (and
+                    // anything it inherits) still applies to the dial.
+                    let group_detour = {
+                        // `config` is a tokio lock and `group_manager` a
+                        // parking_lot one: only the first is a future.
+                        let config = ctx.config.read().await;
+                        let manager = ctx.group_manager.read();
+                        // The selection chain (native-api only) records the real
+                        // owning group as its second-to-last element; fall back
+                        // to it for the detour lookup when the routing group
+                        // itself resolves to none (the `final:` fallback case).
+                        #[cfg(feature = "native-api")]
+                        let owning_group = chain
+                            .get(chain.len().saturating_sub(2))
+                            .map(String::as_str)
+                            .filter(|g| {
+                                !g.is_empty() && *g != node.name.as_str() && *g != outbound.as_str()
+                            });
+                        #[cfg(not(feature = "native-api"))]
+                        let owning_group: Option<&str> = None;
+                        crate::control::node_detour::group_detour(
+                            &config,
+                            &ctx.proxy_registry,
+                            &generation,
+                            &manager,
+                            &outbound,
+                            node.protocol(),
+                        )
+                        .or_else(|| {
+                            owning_group.and_then(|via| {
+                                crate::control::node_detour::group_detour(
+                                    &config,
+                                    &ctx.proxy_registry,
+                                    &generation,
+                                    &manager,
+                                    via,
+                                    node.protocol(),
+                                )
+                            })
+                        })
+                    };
                     let start = std::time::Instant::now();
                     let per_dial_timeout = connect_timeout * 3;
                     let result = {
@@ -123,6 +181,7 @@ impl ControlPlaneHandle {
                             connect_timeout,
                             direct_mark,
                             &scope,
+                            group_detour,
                         );
                         #[cfg(feature = "native-api")]
                         let dial = match &native_observer {
@@ -620,7 +679,7 @@ impl ControlPlaneHandle {
     /// handshakes, warm logical streams, and fresh dials all perform ≥1
     /// round trip through the node and report true.
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn dial_pooled(
+    pub(in crate::control) async fn dial_pooled(
         registry: &ProxyRegistry,
         pool: &ConnectionPool,
         generation: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
@@ -629,12 +688,33 @@ impl ControlPlaneHandle {
         connect_timeout: Duration,
         direct_mark: Option<honk_outbound::proxy::DirectMark>,
         scope: &Arc<honk_outbound::runtime::DialScope>,
+        group_detour: Option<Arc<honk_outbound::proxy::detour::DetourPath>>,
     ) -> anyhow::Result<(crate::proxy::ProxyStream, bool)> {
         anyhow::ensure!(
             !generation.is_shutdown(),
             "outbound runtime generation is shut down"
         );
         let (target, target_domain) = target;
+        // A connection opened over a detour the caller names is not one the
+        // pools can offer: theirs were opened over some other path, and
+        // reusing one would send this flow down whichever that happened to be.
+        if let Some(detour) = group_detour {
+            return scope
+                .scope(async {
+                    registry
+                        .dial_runtime_detoured(
+                            Arc::clone(generation),
+                            node.id,
+                            target,
+                            target_domain,
+                            connect_timeout,
+                            detour,
+                        )
+                        .await
+                        .map(|stream| (stream, true))
+                })
+                .await;
+        }
         // A marked socket belongs to exactly one flow, so it never touches a pool.
         if let Some(mark) = direct_mark {
             return scope
@@ -659,6 +739,17 @@ impl ControlPlaneHandle {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false)
         });
+        // A node that names a detour must not ride a pooled socket. Every
+        // socket in the pool was opened over some other path — usually
+        // direct, always whatever the node rode when it was opened — and a
+        // detour replaces exactly that. Skipping the pools sends the dial
+        // through the generation, whose runtime carries the binding; the
+        // pooled path (`dial_with_tcp`) has no runtime to read one from and
+        // would refuse the dial with "detour ... is not bound".
+        let node_detour = generation
+            .get(&node.id)
+            .and_then(|runtime| runtime.detour());
+        let pools_usable = !pool_disabled && node_detour.is_none();
 
         let addr = format!("{}:{}", node.host(), node.port);
         let protocol = node.protocol();
@@ -666,7 +757,7 @@ impl ControlPlaneHandle {
             .find(protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
 
-        if !pool_disabled && (entry.descriptor.pool_ready_streams)(node) {
+        if pools_usable && (entry.descriptor.pool_ready_streams)(node) {
             let key =
                 ConnectionPool::ready_key(generation.generation(), node.id, target, target_domain);
             if let Some(stream) = pool.acquire_ready(&key).await {
@@ -691,7 +782,7 @@ impl ControlPlaneHandle {
         let dial = async {
             // A raw pooled TCP still needs its protocol handshake. Multiplexed
             // protocols opt out because their node runtime owns the transport.
-            if !pool_disabled
+            if pools_usable
                 && (entry.descriptor.pool_bare_tcp)(node)
                 && let Some(tcp) = pool.acquire_tcp(&addr).await
             {

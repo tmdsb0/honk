@@ -1,6 +1,3 @@
-use std::collections::BTreeMap;
-
-use super::headers;
 use super::validation::ValidationFailure;
 use crate::types::NodeProtocol;
 
@@ -72,8 +69,6 @@ pub struct StreamTransportOptions {
     pub transport: String,
     pub ws_path: Option<String>,
     pub ws_host: Option<String>,
-    /// Additional WebSocket upgrade headers (`Host` stays in [`Self::ws_host`]).
-    pub ws_headers: BTreeMap<String, String>,
     pub grpc_service: Option<String>,
     pub xhttp: Option<super::XhttpOptions>,
 }
@@ -84,7 +79,6 @@ impl Default for StreamTransportOptions {
             transport: "tcp".to_string(),
             ws_path: None,
             ws_host: None,
-            ws_headers: BTreeMap::new(),
             grpc_service: None,
             xhttp: None,
         }
@@ -96,34 +90,16 @@ impl StreamTransportOptions {
         self.transport == "xhttp"
     }
 
-    pub fn normalize(&mut self) -> Result<(), (&'static str, &'static str)> {
-        let kind = crate::options::vocab::xhttp_stream_transport(&self.transport)
-            .map_err(|message| ("transport", message))?;
+    pub fn normalize(&mut self) -> Result<(), &'static str> {
+        let kind = crate::options::vocab::xhttp_stream_transport(&self.transport)?;
         if kind == "xhttp" {
             self.transport = "xhttp".into();
             self.xhttp
                 .get_or_insert_with(Default::default)
-                .normalize()
-                .map_err(|message| ("xhttp", message))?;
+                .normalize()?;
         }
-        headers::normalize(&mut self.ws_headers).map_err(|message| ("ws_headers", message))?;
-        self.check()
+        self.check().map_err(|(_, message)| message)
     }
-
-    /// Headers tungstenite writes or verifies itself, plus ones that would
-    /// alter framing.
-    const MANAGED_WS_HEADERS: &[&str] = &[
-        "host",
-        "connection",
-        "upgrade",
-        "sec-websocket-key",
-        "sec-websocket-version",
-        "sec-websocket-extensions",
-        "sec-websocket-accept",
-        "sec-websocket-protocol",
-        "content-length",
-        "transfer-encoding",
-    ];
 
     pub(super) fn check(&self) -> Result<(), (&'static str, &'static str)> {
         let kind = crate::options::vocab::xhttp_stream_transport(&self.transport)
@@ -140,25 +116,11 @@ impl StreamTransportOptions {
                 .ok_or(("xhttp", "XHTTP requires canonical options"))?
                 .validate()
                 .map_err(|message| ("xhttp", message))?;
-            if self.ws_path.is_some()
-                || self.ws_host.is_some()
-                || !self.ws_headers.is_empty()
-                || self.grpc_service.is_some()
-            {
+            if self.ws_path.is_some() || self.ws_host.is_some() || self.grpc_service.is_some() {
                 return Err(("xhttp", "XHTTP cannot use WebSocket or gRPC options"));
             }
         } else if self.xhttp.is_some() {
             return Err(("xhttp", "XHTTP options require XHTTP transport"));
-        }
-        if !self.ws_headers.is_empty() {
-            if kind != "ws" {
-                return Err((
-                    "ws_headers",
-                    "WebSocket headers require WebSocket transport",
-                ));
-            }
-            headers::validate(&self.ws_headers, Self::MANAGED_WS_HEADERS)
-                .map_err(|message| ("ws_headers", message))?;
         }
         Ok(())
     }
@@ -243,6 +205,40 @@ pub struct AnyTlsConfig {
     pub tls: TlsOptions,
 }
 
+/// MASQUE connect-ip (RFC 9484): an IP-layer tunnel carried over HTTP/2
+/// extended CONNECT (RFC 8441) or HTTP/3.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MasqueConfig {
+    /// Tunnel carrier: `h2` (HTTP/2 + DATAGRAM capsule) or `quic` (HTTP/3 +
+    /// QUIC DATAGRAM). Defaults to `h2` when absent.
+    pub network: Option<String>,
+    /// Base64 SEC1 ECDSA P-256 device private key, as used by WARP-style
+    /// endpoints. Optional: plain endpoints need no key material.
+    pub private_key: Option<String>,
+    /// Base64 SEC1 ECDSA P-256 endpoint public key, when the server pins one.
+    pub endpoint_public_key: Option<String>,
+    /// IPv4 address the tunnel is expected to assign, e.g. `172.16.0.2` or
+    /// `100.96.0.6/32`. When absent the address comes from ADDRESS_ASSIGN.
+    pub local_ipv4: Option<String>,
+    /// IPv6 address the tunnel is expected to assign.
+    pub local_ipv6: Option<String>,
+    /// MTU for the TUN device. 1280 is the usual WARP value.
+    pub mtu: Option<u16>,
+    /// Let the endpoint resolve names instead of resolving locally.
+    pub remote_dns_resolve: bool,
+    /// DNS servers to use inside the tunnel.
+    pub dns: Vec<String>,
+    pub tls: TlsOptions,
+}
+
+impl MasqueConfig {
+    /// Carrier the node dials over. Matches mihomo: an absent `network` means
+    /// HTTP/3, so both the dial path and node identity agree on one answer.
+    pub fn network(&self) -> &str {
+        self.network.as_deref().unwrap_or("quic")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutboundConfig {
     Shadowsocks(ShadowsocksConfig),
@@ -254,6 +250,7 @@ pub enum OutboundConfig {
     Tuic(TuicConfig),
     Juicity(JuicityConfig),
     AnyTls(AnyTlsConfig),
+    Masque(MasqueConfig),
     Direct,
     Block,
 }
@@ -276,6 +273,7 @@ impl OutboundConfig {
             NodeProtocol::Tuic => Self::Tuic(TuicConfig::default()),
             NodeProtocol::Juicity => Self::Juicity(JuicityConfig::default()),
             NodeProtocol::AnyTLS => Self::AnyTls(AnyTlsConfig::default()),
+            NodeProtocol::Masque => Self::Masque(MasqueConfig::default()),
             NodeProtocol::Direct => Self::Direct,
             NodeProtocol::Block => Self::Block,
         }
@@ -292,6 +290,7 @@ impl OutboundConfig {
             Self::Tuic(_) => NodeProtocol::Tuic,
             Self::Juicity(_) => NodeProtocol::Juicity,
             Self::AnyTls(_) => NodeProtocol::AnyTLS,
+            Self::Masque(_) => NodeProtocol::Masque,
             Self::Direct => NodeProtocol::Direct,
             Self::Block => NodeProtocol::Block,
         }
@@ -306,6 +305,7 @@ impl OutboundConfig {
             Self::Tuic(config) => Some(&config.quic.tls),
             Self::Juicity(config) => Some(&config.quic.tls),
             Self::AnyTls(config) => Some(&config.tls),
+            Self::Masque(config) => Some(&config.tls),
             Self::Shadowsocks(_) | Self::Socks5(_) | Self::Direct | Self::Block => None,
         }
     }
@@ -319,6 +319,7 @@ impl OutboundConfig {
             Self::Tuic(config) => Some(&mut config.quic.tls),
             Self::Juicity(config) => Some(&mut config.quic.tls),
             Self::AnyTls(config) => Some(&mut config.tls),
+            Self::Masque(config) => Some(&mut config.tls),
             Self::Shadowsocks(_) | Self::Socks5(_) | Self::Direct | Self::Block => None,
         }
     }
@@ -365,6 +366,20 @@ impl OutboundConfig {
         }
     }
 
+    pub fn masque(&self) -> Option<&MasqueConfig> {
+        match self {
+            Self::Masque(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn masque_mut(&mut self) -> Option<&mut MasqueConfig> {
+        match self {
+            Self::Masque(config) => Some(config),
+            _ => None,
+        }
+    }
+
     pub(crate) fn credential_fingerprint(&self) -> String {
         match self {
             Self::Shadowsocks(config) => identity_join(&[
@@ -392,6 +407,10 @@ impl OutboundConfig {
                 config.password.as_deref().unwrap_or(""),
             ]),
             Self::AnyTls(config) => identity_join(&[config.password.as_deref().unwrap_or("")]),
+            Self::Masque(config) => identity_join(&[
+                config.private_key.as_deref().unwrap_or(""),
+                config.endpoint_public_key.as_deref().unwrap_or(""),
+            ]),
             Self::Direct | Self::Block => String::new(),
         }
     }
@@ -428,13 +447,11 @@ impl OutboundConfig {
         ]
         .map(identity_field)
         .join("|");
-        if let Some(headers) = transport
-            .map(|transport| &transport.ws_headers)
-            .filter(|headers| !headers.is_empty())
-        {
-            fingerprint.push_str("|ws-headers:");
-            fingerprint
-                .push_str(&serde_json::to_string(headers).expect("WebSocket headers serialize"));
+        if let Self::Masque(config) = self {
+            // The carrier is a different endpoint: the same address answers h2
+            // and h3 on separate shapes, and subscriptions list both.
+            fingerprint.push_str("|masque-network:");
+            fingerprint.push_str(config.network());
         }
         if let Self::Vless(config) = self {
             fingerprint.push('|');

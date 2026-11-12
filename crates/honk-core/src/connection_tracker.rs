@@ -4,9 +4,10 @@
 //! (accept loop, relay workers, and HTTP API handlers).
 
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use std::net::{IpAddr, SocketAddr};
 use tokio::sync::watch;
@@ -40,6 +41,12 @@ pub(crate) struct CloseSignal(watch::Sender<ClosePhase>);
 impl CloseSignal {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self(watch::channel(ClosePhase::Active).0))
+    }
+
+    /// True once the owning transport has finished (cleanly or with a failure).
+    /// Used by the tracker sweeper to reclaim rows whose removal path failed.
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(*self.0.borrow(), ClosePhase::Closed | ClosePhase::Failed)
     }
 
     fn claim(&self) -> bool {
@@ -103,6 +110,13 @@ pub(crate) enum CloseAction {
         token: u32,
         generation: u64,
     },
+    /// A userspace listener relay with no kernel-side action to perform. One
+    /// row owns one TCP relay or one whole UDP ASSOCIATE session, so claiming
+    /// it simply wakes that single owner through `Notify`; the owner then
+    /// tears everything down and acknowledges with `CloseSignal::finish(true)`.
+    Inbound {
+        cancel: Arc<tokio::sync::Notify>,
+    },
 }
 
 pub(crate) struct ConnectionOwner {
@@ -114,6 +128,10 @@ pub(crate) struct ConnectionOwner {
 struct TrackedConnection {
     entry: ConnectionEntry,
     owner: Option<Arc<ConnectionOwner>>,
+    /// First tick at which the owner's CloseSignal was observed terminal.
+    /// Some(..) means the transport has ended and the row is only being kept
+    /// for a short grace period before the sweeper reclaims it.
+    terminal_since: Option<Instant>,
 }
 
 pub(crate) struct SelectedConnection {
@@ -336,8 +354,14 @@ impl ConnectionTracker {
     /// Register a new connection and return its unique ID (UUID v4).
     pub fn register(&self, entry: ConnectionEntry) -> String {
         let id = entry.id.clone();
-        self.entries
-            .insert(id.clone(), TrackedConnection { entry, owner: None });
+        self.entries.insert(
+            id.clone(),
+            TrackedConnection {
+                entry,
+                owner: None,
+                terminal_since: None,
+            },
+        );
         id
     }
 
@@ -348,6 +372,7 @@ impl ConnectionTracker {
             TrackedConnection {
                 entry,
                 owner: Some(Arc::new(owner)),
+                terminal_since: None,
             },
         );
         id
@@ -467,21 +492,33 @@ impl ConnectionTracker {
             return CloseRequest::Immediate(CloseOutcome::Gone);
         }
         let owner = selected.owner.expect("claimed transport owner");
-        if let CloseAction::Udp {
-            pool,
-            client,
-            destination,
-            token,
-            generation,
-        } = &owner.action
-        {
-            let Some(pool) = pool.upgrade() else {
-                owner.signal.finish(false);
-                return CloseRequest::Pending(Arc::clone(&owner.signal));
-            };
-            if !pool.close_exact(*client, *destination, *token, *generation) {
-                owner.signal.finish(false);
+        match &owner.action {
+            CloseAction::Udp {
+                pool,
+                client,
+                destination,
+                token,
+                generation,
+            } => {
+                let Some(pool) = pool.upgrade() else {
+                    owner.signal.finish(false);
+                    // No removal will ever be produced for this close: the pool is
+                    // gone, so neither settle() nor the endpoint can reclaim the
+                    // row. Drop the observation immediately.
+                    self.remove(&selected.id);
+                    return CloseRequest::Pending(Arc::clone(&owner.signal));
+                };
+                if !pool.close_exact(*client, *destination, *token, *generation) {
+                    owner.signal.finish(false);
+                    // close_exact returned false: no EndpointRemoval is emitted,
+                    // which used to leave the row in the unbounded map forever.
+                    self.remove(&selected.id);
+                }
             }
+            // Claiming already moved the signal out of `Active`; the relay
+            // wakes on this notification, drops its sockets and acknowledges.
+            CloseAction::Inbound { cancel } => cancel.notify_one(),
+            CloseAction::Tcp => {}
         }
         CloseRequest::Pending(Arc::clone(&owner.signal))
     }
@@ -516,6 +553,57 @@ impl ConnectionTracker {
         self.entries.remove(id);
     }
 
+    /// Last-resort reclamation of observation rows whose owning transport has
+    /// already finished. Called on every janitor tick.
+    ///
+    /// A terminal [`CloseSignal`] is authoritative: the relay/driver is gone,
+    /// so a row still present here can only be a leaked observation (failed
+    /// retirement, lost owner, kernel table reclaimed without a userspace
+    /// removal). Keeping it briefly lets in-flight close requests observe the
+    /// outcome; after `grace` it is dropped unconditionally.
+    ///
+    /// Rows whose transport is still active are never touched, so legitimate
+    /// long-lived idle connections (Telegram, push, mtalk) are safe — this is
+    /// deliberately not a start_time/idle TTL.
+    pub(crate) fn sweep_terminal(&self, grace: Duration) -> usize {
+        let now = Instant::now();
+        let ids: Vec<String> = self.entries.iter().map(|row| row.key().clone()).collect();
+        let mut expired = Vec::new();
+        for id in &ids {
+            let Some(mut tracked) = self.entries.get_mut(id) else {
+                continue;
+            };
+            let terminal = tracked
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.signal.is_terminal());
+            if terminal {
+                let since = *tracked.terminal_since.get_or_insert(now);
+                if now.duration_since(since) >= grace {
+                    expired.push(id.clone());
+                }
+            } else {
+                tracked.terminal_since = None;
+            }
+        }
+        let count = expired.len();
+        for id in expired {
+            self.entries.remove(&id);
+        }
+        count
+    }
+
+    /// Snapshot of rows whose transport has finished. Taken once per API page
+    /// so the connections handler can report a real state without re-entering
+    /// the map while it is being visited.
+    pub(crate) fn terminal_ids(&self) -> HashSet<String> {
+        self.entries
+            .iter()
+            .filter(|row| row.value().terminal_since.is_some())
+            .map(|row| row.key().clone())
+            .collect()
+    }
+
     /// Return a point-in-time snapshot of all active connections.
     pub fn snapshot(&self) -> Vec<ConnectionSnapshot> {
         self.entries
@@ -533,7 +621,97 @@ impl Default for ConnectionTracker {
 
 #[cfg(test)]
 mod tests {
-    use super::ConnectionTracker;
+    use super::*;
+
+    fn test_entry(id: &str, network: &str) -> ConnectionEntry {
+        ConnectionEntry {
+            id: id.into(),
+            source: "172.20.1.20:50000".into(),
+            destination: "1.1.1.1:443".into(),
+            proxy: "Final".into(),
+            #[cfg(feature = "native-api")]
+            routed_outbound: Some("Final".into()),
+            #[cfg(feature = "native-api")]
+            native_flow_id: None,
+            rule: "Fallback".into(),
+            rule_payload: String::new(),
+            chains: vec!["Final".into()],
+            upload: Arc::new(AtomicU64::new(0)),
+            download: Arc::new(AtomicU64::new(0)),
+            start_time: Instant::now(),
+            domain: None,
+            network: network.into(),
+            process: None,
+            process_path: None,
+        }
+    }
+
+    /// Stand-in for a userspace listener relay: a close request notifies it,
+    /// it drops both sockets and acknowledges transport teardown.
+    fn inbound_owner(
+        tracker: &ConnectionTracker,
+        entry: ConnectionEntry,
+    ) -> (String, Arc<tokio::sync::Notify>, Arc<CloseSignal>) {
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        let signal = CloseSignal::new();
+        let id = tracker.register_owned(
+            entry,
+            ConnectionOwner {
+                signal: Arc::clone(&signal),
+                action: CloseAction::Inbound {
+                    cancel: Arc::clone(&cancel),
+                },
+                groups: Vec::new(),
+            },
+        );
+        (id, cancel, signal)
+    }
+
+    #[tokio::test]
+    async fn inbound_connection_is_closable_by_id() {
+        let tracker = ConnectionTracker::new();
+        let (id, cancel, signal) = inbound_owner(&tracker, test_entry("inbound-tcp", "tcp"));
+        let relay = tokio::spawn(async move {
+            cancel.notified().await;
+            signal.finish(true);
+        });
+        assert_eq!(tracker.close_id(&id).await, CloseOutcome::Closed);
+        relay.await.unwrap();
+        tracker.remove(&id);
+    }
+
+    #[tokio::test]
+    async fn bulk_close_counts_inbound_connections_as_closed() {
+        let tracker = ConnectionTracker::new();
+        let (tcp_id, tcp_cancel, tcp_signal) =
+            inbound_owner(&tracker, test_entry("inbound-tcp", "tcp"));
+        let (udp_id, udp_cancel, udp_signal) =
+            inbound_owner(&tracker, test_entry("inbound-udp", "udp"));
+        // A row without an owner (e.g. a legacy observation) must still be
+        // reported as skipped, not silently counted as closed.
+        tracker.register(test_entry("unowned", "tcp"));
+
+        let relays = tokio::spawn(async move {
+            let tcp = tokio::spawn(async move {
+                tcp_cancel.notified().await;
+                tcp_signal.finish(true);
+            });
+            let udp = tokio::spawn(async move {
+                udp_cancel.notified().await;
+                udp_signal.finish(true);
+            });
+            let _ = tcp.await;
+            let _ = udp.await;
+        });
+
+        let summary = tracker.close_matching(None, None, 100).await.unwrap();
+        assert_eq!(summary.closed, 2);
+        assert_eq!(summary.skipped, 1);
+        assert!(!summary.failed);
+        relays.await.unwrap();
+        tracker.remove(&tcp_id);
+        tracker.remove(&udp_id);
+    }
 
     #[test]
     fn interrupt_consumer_survives_api_shutdown() {

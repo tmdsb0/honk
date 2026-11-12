@@ -579,7 +579,10 @@ fn direct_alpn_must_normalize_before_config_admission() {
         let mut node = canonical.clone();
         node.tls_mut().unwrap().alpn = alpn;
         assert!(node.validate_protocol().is_err());
-        assert!(node.normalize_stream_transport().is_err());
+        assert_eq!(
+            node.normalize_stream_transport(),
+            Err("XHTTP requires H2-only ALPN")
+        );
     }
 }
 

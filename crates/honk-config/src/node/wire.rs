@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use serde::de::{DeserializeSeed, Error as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -13,7 +11,7 @@ use crate::options::vocab::{coalesce_equal, optional_flow, packet_network};
 use crate::types::NodeProtocol;
 
 use super::{
-    AnyTlsConfig, Hysteria2Config, JuicityConfig, Node, OutboundConfig, QuicOptions,
+    AnyTlsConfig, Hysteria2Config, JuicityConfig, MasqueConfig, Node, OutboundConfig, QuicOptions,
     ShadowsocksConfig, Socks5Config, StreamTransportOptions, TlsOptions, TrojanConfig, TuicConfig,
     VlessConfig, VlessMultiplex, VlessUdpEncoding, VmessConfig,
 };
@@ -131,8 +129,6 @@ struct FlatNode {
     #[serde(default)]
     ws_host: Option<String>,
     #[serde(default)]
-    ws_headers: BTreeMap<String, String>,
-    #[serde(default)]
     grpc_service: Option<String>,
     #[serde(default)]
     hy2_auth: Option<String>,
@@ -180,6 +176,25 @@ struct FlatNode {
     anytls_idle_session_check_interval: Option<u64>,
     #[serde(default)]
     anytls_idle_session_timeout: Option<u64>,
+    #[serde(default)]
+    masque_private_key: Option<String>,
+    #[serde(default)]
+    masque_endpoint_public_key: Option<String>,
+    #[serde(default)]
+    masque_local_ipv4: Option<String>,
+    #[serde(default)]
+    masque_local_ipv6: Option<String>,
+    #[serde(default)]
+    masque_remote_dns_resolve: Option<bool>,
+    #[serde(default)]
+    masque_dns: Vec<String>,
+    /// The node or group this node dials through before reaching its own
+    /// server. Deliberately unprefixed: the path out is no more a MASQUE
+    /// property than it is a Trojan one. `masque_detour` stays as an alias so
+    /// configurations written while the field belonged to MASQUE alone keep
+    /// loading, and MASQUE keeps its own detour behaviour unchanged.
+    #[serde(default, alias = "masque_detour", alias = "masque-detour")]
+    detour: Option<String>,
     #[serde(default)]
     mark: Option<u32>,
     #[serde(default)]
@@ -263,6 +278,7 @@ impl FlatNode {
                 | NodeProtocol::Tuic
                 | NodeProtocol::Juicity
                 | NodeProtocol::AnyTLS
+                | NodeProtocol::Masque
         );
         let reality = matches!(
             self.protocol,
@@ -398,7 +414,6 @@ impl FlatNode {
         );
         strip!(self.ws_path.is_some() && !stream, ws_path);
         strip!(self.ws_host.is_some() && !stream, ws_host);
-        strip!(!self.ws_headers.is_empty() && !stream, ws_headers);
         strip!(self.grpc_service.is_some() && !stream, grpc_service);
 
         let hy2 = self.protocol == NodeProtocol::Hysteria2;
@@ -425,8 +440,11 @@ impl FlatNode {
             self.protocol,
             NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity
         );
+        // MASQUE carries a TUN MTU in the same field: like the QUIC protocols
+        // it is an IP-ish transport whose packet size must be configurable.
+        let masque = self.protocol == NodeProtocol::Masque;
         strip!(self.tls_pin_sha256.is_some() && !tls, tls_pin_sha256);
-        strip!(self.quic_mtu.is_some() && !quic, quic_mtu);
+        strip!(self.quic_mtu.is_some() && !(quic || masque), quic_mtu);
 
         let tuic = self.protocol == NodeProtocol::Tuic;
         strip!(self.tuic_uuid.is_some() && !tuic, tuic_uuid);
@@ -464,6 +482,28 @@ impl FlatNode {
             anytls_idle_session_timeout
         );
 
+        strip!(
+            self.masque_private_key.is_some() && !masque,
+            masque_private_key
+        );
+        strip!(
+            self.masque_endpoint_public_key.is_some() && !masque,
+            masque_endpoint_public_key
+        );
+        strip!(
+            self.masque_local_ipv4.is_some() && !masque,
+            masque_local_ipv4
+        );
+        strip!(
+            self.masque_local_ipv6.is_some() && !masque,
+            masque_local_ipv6
+        );
+        strip!(
+            self.masque_remote_dns_resolve.is_some() && !masque,
+            masque_remote_dns_resolve
+        );
+        strip!(!self.masque_dns.is_empty() && !masque, masque_dns);
+
         if !dropped.is_empty() {
             diagnostics.push(DetailedDiagnostic::warning(
                 "incompatible-node-fields",
@@ -500,7 +540,6 @@ impl FlatNode {
             transport: std::mem::take(&mut self.transport),
             ws_path: self.ws_path.take(),
             ws_host: self.ws_host.take(),
-            ws_headers: std::mem::take(&mut self.ws_headers),
             grpc_service: self.grpc_service.take(),
             xhttp: self.xhttp.take(),
         }
@@ -679,6 +718,20 @@ impl FlatNode {
                     tls,
                 })
             }
+            NodeProtocol::Masque => {
+                let tls = flat.take_tls();
+                OutboundConfig::Masque(MasqueConfig {
+                    network: flat.network.take(),
+                    private_key: flat.masque_private_key.take(),
+                    endpoint_public_key: flat.masque_endpoint_public_key.take(),
+                    local_ipv4: flat.masque_local_ipv4.take(),
+                    local_ipv6: flat.masque_local_ipv6.take(),
+                    mtu: flat.quic_mtu,
+                    remote_dns_resolve: flat.masque_remote_dns_resolve.unwrap_or(false),
+                    dns: std::mem::take(&mut flat.masque_dns),
+                    tls,
+                })
+            }
             NodeProtocol::Direct => OutboundConfig::Direct,
             NodeProtocol::Block => OutboundConfig::Block,
         };
@@ -696,6 +749,7 @@ impl FlatNode {
             host: flat.host,
             port: flat.port,
             outbound,
+            detour: flat.detour,
             mark: flat.mark,
             tags: flat.tags,
             subscription_id: flat.subscription_id,
@@ -704,9 +758,7 @@ impl FlatNode {
             updated_at: flat.updated_at,
         };
         node.normalize_stream_transport()
-            .map_err(|(field, message)| {
-                semantic_error(source, setting.clone().field(field), message)
-            })?;
+            .map_err(|message| semantic_error(source, setting.clone().field("xhttp"), message))?;
         node.validate_detailed_at(source, setting)?;
         if let Some(config) = node.vless_mut() {
             config.normalize();
@@ -753,8 +805,6 @@ struct WireOptions<'a> {
     network: Option<&'a str>,
     ws_path: Option<&'a str>,
     ws_host: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ws_headers: Option<&'a BTreeMap<String, String>>,
     grpc_service: Option<&'a str>,
     hy2_auth: Option<&'a str>,
     hy2_obfs: Option<&'a str>,
@@ -779,6 +829,20 @@ struct WireOptions<'a> {
     anytls_min_idle_session: Option<usize>,
     anytls_idle_session_check_interval: Option<u64>,
     anytls_idle_session_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    masque_private_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    masque_endpoint_public_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    masque_local_ipv4: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    masque_local_ipv6: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    masque_remote_dns_resolve: Option<bool>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    masque_dns: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detour: Option<&'a str>,
     mark: Option<u32>,
     tags: &'a [String],
     subscription_id: Option<uuid::Uuid>,
@@ -806,7 +870,6 @@ impl<'a> WireOptions<'a> {
         self.transport = &transport.transport;
         self.ws_path = transport.ws_path.as_deref();
         self.ws_host = transport.ws_host.as_deref();
-        self.ws_headers = (!transport.ws_headers.is_empty()).then_some(&transport.ws_headers);
         self.grpc_service = transport.grpc_service.as_deref();
         self.xhttp = transport.xhttp.as_ref();
     }
@@ -827,6 +890,7 @@ impl<'a> WireOptions<'a> {
             group_id: node.group_id,
             created_at: node.created_at,
             updated_at: node.updated_at,
+            detour: node.detour_name(),
             ..Self::default()
         };
         match &node.outbound {
@@ -908,6 +972,17 @@ impl<'a> WireOptions<'a> {
                 wire.anytls_min_idle_session = config.min_idle_session;
                 wire.anytls_idle_session_check_interval = config.idle_session_check_interval;
                 wire.anytls_idle_session_timeout = config.idle_session_timeout;
+                wire.set_tls(&config.tls);
+            }
+            OutboundConfig::Masque(config) => {
+                wire.network = config.network.as_deref();
+                wire.quic_mtu = config.mtu;
+                wire.masque_private_key = config.private_key.as_deref();
+                wire.masque_endpoint_public_key = config.endpoint_public_key.as_deref();
+                wire.masque_local_ipv4 = config.local_ipv4.as_deref();
+                wire.masque_local_ipv6 = config.local_ipv6.as_deref();
+                wire.masque_remote_dns_resolve = Some(config.remote_dns_resolve);
+                wire.masque_dns = config.dns.as_slice();
                 wire.set_tls(&config.tls);
             }
             OutboundConfig::Direct | OutboundConfig::Block => {}

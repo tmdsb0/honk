@@ -6,79 +6,6 @@ This changelog follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 Entries live in [changes/](changes/) until release.
 
-## [0.1.0-beta.6] - 2026-11-09
-
-### Added
-
-- DNS request rules accept `subtag(...)`, which resolves the server hosts of nodes from matching subscriptions through a chosen `-> direct` upstream (for example a provider's own DoH) instead of the bootstrap resolver. Each DNS generation precomputes host policy outcomes; native flow traces explicitly mark consumption of these decisions as incomplete evidence (`not_instrumented`). (#463)
-- Add default-off `dns-syslog` Cargo support to send client DNS outcomes to a configured TCP syslog receiver with `global.syslog_dns_enabled` and `global.syslog_addr`, independently of native API history. (#462)
-- Preserve complete DNS answers and include deduplicated IP, CNAME and record-type arrays for search. (#462)
-- Include monotonic processing time as numeric `duration_ms` and final upstream name as `upstream` in DNS audit events; cache responses use `cache`, and results without upstream metadata use null. (#462)
-- Configure sender hostname and application name only in syslog headers using `global.syslog_hostname` and `global.syslog_app_name`, avoiding duplicate fields when receivers parse the JSON body. (#462)
-- Reuse one TCP connection with octet-counted whole events, bounded batching and reconnect backoff. (#462)
-- Emit a fixed RFC 5424 header and JSON schema; optionally prefix CEE with `global.syslog_cee_enabled` (default false), and reject obsolete format-template settings. (#462)
-- Preserve final-upstream and response-source metadata when a concurrent DNS query reuses an in-flight result without a cache hit, including stale-cache fallback. (#462)
-- Include a readable `message` in DNS audit JSON so CEE syslog receivers can display each event; VictoriaLogs maps it to `_msg` instead of using its missing-message placeholder. (#462)
-- Keep the DNS audit event when a delivered response's answers cannot be rendered, with `answers: null` and the reason in `answers_omitted`. (#462)
-
-### Changed
-
-- The shipped `honk-core` binary now allocates through jemalloc instead of mimalloc; `-stock` archives still use the system allocator. (#455)
-- The `honk-core` Cargo feature formerly named `mimalloc` is now `jemalloc`; builds with `--no-default-features` keep the system allocator. (#455)
-- Release downloads label the default allocator `jemalloc-*` instead of `mimalloc-*`. (#455)
-- Removed the mimalloc-only `HONK_MI_COLLECT_SECS` and `MIMALLOC_PURGE_DELAY` environment variables and the worker idle-collection machinery they controlled. (#455)
-- Runtime jemalloc options use `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`: the crate prefixes jemalloc symbols and the environment variable with `_rjem_`. (#455)
-- Startup verifies only the TC programs the configured interfaces bind (plus one routing target when they bind none), so a WAN-only Ethernet host no longer loads the LAN or L3 variants. Later variants are verified outside the shared backend lock and become bindable only after receiving the current routing generation; a failed variant does not block independent variants. Logging and event-consumer cancellation preserve the original map FDs required by deferred loads. (#450)
-- Full builds embed doona 0.1.0-rc.6 with both editions. (#472)
-
-### Fixed
-
-- Bound each DNS cache shard's answer bytes to `max(entry capacity × 1 KiB, 65,535 bytes)`, evicting LRU entries when large answers fill the budget. (#454)
-- Inline DNS cache insert/remove accounting in size-optimized builds. (#454)
-- Group probes measure up to 10 members at once, so a slow member no longer leaves later members at `deadline`. (#459)
-- Probe target resolution failures are logged with the host and DNS error instead of appearing only as `address_unavailable`. (#459)
-- Probe targets fall back to bootstrap DNS when the running DNS configuration cannot answer, so `asis` routing no longer reports every probe as `address_unavailable`. (#459)
-- A refused `--store db` start no longer leaves an empty state database, or its data directory, behind. (#467)
-- Subscription connection and HTTP status failures name the selected node and group in the log. Classified fetch failures report their stage and available outbound attribution in native API provider `last_error.details`, including completed failures retained during shutdown; unusable subscription content reports `parse_failed`. (#451)
-
-### Internal
-
-- Move the aya family to userspace `aya` 0.16, `aya-obj` 0.6, `aya-log` 0.4 and kernel-side `aya-ebpf` 0.3, adapting call sites to the new map, loader and TC context APIs while preserving programs, map names and shared binary layouts. (#436)
-- Make shared payload padding explicit and restrict locked-value `Pod` implementations to the three audited payloads; reject stale BTF schemas without changing existing field offsets or map-value sizes. (#436)
-
-## [0.1.0-beta.5] - 2026-11-03
-
-### Added
-
-- Formal releases attach `.deb`, `.rpm` and Arch Linux packages for `x86_64` and `aarch64`, which install `honk-core`, `honk-core.service` and an example configuration. (#417)
-
-### Changed
-
-- Full builds embed doona 0.1.0-rc.5 with both editions.
-- Add reloadable `global.shutdown_wait_connections` (default `false`). Set `true` to retain the previous five-second connection grace; mandatory cleanup and native HTTP shutdown are unchanged. (#410)
-
-### Fixed
-
-- AnyTLS nodes with `min_idle_session` above one now keep that many idle sessions open. The pool janitor previously reused the idle session it already had and never dialed the rest ([#260](https://github.com/daeuniverse/honk/issues/260)). (#405)
-- Clash subscriptions that pin a server certificate with `fingerprint` now import it as `tls_pin_sha256` instead of failing the TLS handshake. (#420)
-- Clash and Clash-compatible subscriptions keep VMess nodes whose `udp: true` claim honk cannot honor; the node now imports for TCP instead of being dropped. (#443)
-- Clash and sing-box subscriptions import WebSocket upgrade headers other than `Host`, so nodes that require `ws-opts.headers.User-Agent` are no longer dropped. The headers participate in node identity and are sent on the upgrade. (#421)
-- Direct and supplied-TCP WebSocket dials enforce the same header limits and reserved-name rules as subscription admission, before network I/O. (#421)
-- sing-box keeps empty WebSocket header strings and rejects invalid or conflicting claims instead of silently dropping them. (#421)
-- Structured node errors retain the actual transport or header field instead of being mislabeled as XHTTP errors. (#421)
-- Clash WebSocket Host extraction retains its first-usable scalar and lazy fallback behavior while additional headers remain strictly checked. (#421)
-- Subscription stream-normalization failures retain their canonical field alongside the original entry index, preserving transport context without exposing supplied header names or values. (#421)
-- A TCP health-check cooldown no longer skips a node's due UDP probe, and an emergency TCP probe no longer clears UDP cooldowns. (#408)
-- Health-check cycles skip worker creation when both TCP and UDP probes are cooling down. (#408)
-- When NFQUEUE is unavailable at startup, configuration writes and reloads are no longer refused because `global.nfqueue_enable` needs a restart; the reloaded configuration keeps NFQUEUE disabled. (#407)
-- A subscription that shares a node with another subscription now loads its other nodes; the shared node stays with the subscription that published it first. (#406)
-- Retry failed subscription fetches with exponential backoff instead of waiting for the full refresh interval. (#412)
-- Traffic on L3-typed interfaces whose driver still sends Ethernet frames (for example RAWIP cellular modems) is intercepted again. (#427)
-
-### Security
-
-- AES-GCM no longer uses a `ctutils` release whose mask generation and `u128` comparisons are not constant-time (RUSTSEC-2026-0385); `ctutils` is now 0.4.7. (#441)
-
 ## [0.1.0-beta.4] - 2026-10-30
 
 ### Added
@@ -158,9 +85,7 @@ Summarised from the [release notes](https://github.com/daeuniverse/honk/releases
 - Shared UDP sources survive malformed SOCKS5, Trojan and Juicity datagrams.
 - QUIC session tickets honour `skip_cert_verify`, and a reload restores warm carriers and probes.
 
-[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.6...HEAD
-[0.1.0-beta.6]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.5...v0.1.0-beta.6
-[0.1.0-beta.5]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.4...v0.1.0-beta.5
+[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.4...HEAD
 [0.1.0-beta.4]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.3...v0.1.0-beta.4
 [0.1.0-beta.3]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.2...v0.1.0-beta.3
 [0.1.0-beta.2]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.1...v0.1.0-beta.2

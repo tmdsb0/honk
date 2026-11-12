@@ -7,6 +7,7 @@ mod connection;
 pub mod dns_control;
 mod dns_listener;
 pub mod drain;
+mod inbound;
 pub mod janitor;
 #[cfg(feature = "ebpf")]
 pub(crate) mod nfqueue;
@@ -20,6 +21,7 @@ use nfqueue_runtime::{
 #[cfg(feature = "ebpf")]
 use nfqueue_runtime::{NfqueueRuntime, NfqueueRuntimeEvent, wait_nfqueue_event};
 mod lifecycle;
+pub(crate) mod node_detour;
 pub mod packet_sniffer;
 mod preconnect;
 mod probers;
@@ -132,7 +134,6 @@ pub(crate) enum EnginePhase {
 
 /// The main control plane.
 pub struct ControlPlane {
-    dns_audit: Option<crate::audit::DnsAuditWorker>,
     config: Arc<RwLock<Arc<Config>>>,
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     /// Reuse decisions must observe the generation they eventually replace.
