@@ -3,12 +3,14 @@
 
 use crate::{
     action::{TC_ACT_REDIRECT, TC_ACT_SHOT},
-    maps::{FRAG_VERDICT, PKT_SCRATCH_KEY},
+    maps::{FRAG_VERDICT, PKT_SCRATCH_KEY, increment_bpf_stat},
     transport::{IPPROTO_UDP, ParsedPacket},
 };
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use core::mem;
-use honk_ebpf_common::conn::{FRAGMENT_VERDICT_TTL_NS, FragmentKey, FragmentVerdict};
+use honk_ebpf_common::conn::{
+    BpfStatsKey, FRAGMENT_VERDICT_TTL_NS, FragmentKey, FragmentVerdict,
+};
 
 #[inline(always)]
 fn key(pkt: &ParsedPacket) -> FragmentKey {
@@ -63,6 +65,14 @@ pub fn record(verdict: i32) -> i32 {
         padding: 0,
         ktime_ns: unsafe { bpf_ktime_get_ns() },
     };
-    let _ = FRAG_VERDICT.insert(&key(pkt), &value, 0);
+    if FRAG_VERDICT.insert(&key(pkt), &value, 0).is_err() {
+        increment_bpf_stat(BpfStatsKey::FragmentVerdictInsertFailure);
+        // Without a recorded verdict later fragments take the original path.
+        // Dropping the head instead of redirecting it avoids a datagram whose
+        // head is proxied while its tail leaves unproxied.
+        if verdict == TC_ACT_REDIRECT as i32 {
+            return TC_ACT_SHOT as i32;
+        }
+    }
     verdict
 }

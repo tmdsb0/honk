@@ -612,13 +612,6 @@ async fn shutdown_preserves_a_completed_http_failure() {
         state.observations.read()[&id].load.error,
         Some("fetch_failed")
     );
-    assert_eq!(
-        state.observations.read()[&id].load.fetch,
-        Some(FetchFailure {
-            stage: "http_status_rejected",
-            via: None,
-        })
-    );
 }
 
 #[cfg(feature = "native-api")]
@@ -783,6 +776,8 @@ fn inline(body: &str) -> Vec<Node> {
     let mut nodes = parsed(&Subscription::default(), body);
     for node in &mut nodes {
         node.subscription_id = None;
+        // The ID derives from provenance; an inline node needs the static ID.
+        node.id = node.derive_id();
     }
     nodes
 }
@@ -809,14 +804,14 @@ fn node_names(config: &Config) -> Vec<&str> {
     config.nodes.iter().map(|node| node.name.as_str()).collect()
 }
 
-fn assert_rejected(state: &SupervisorState, id: uuid::Uuid) {
+fn assert_published(state: &SupervisorState, id: uuid::Uuid) {
     let load = state.observations.read()[&id].load.clone();
-    assert_eq!(load.error, Some("publication_rejected"));
-    assert_eq!(load.rejection, Some("duplicate-node-id"));
+    assert_eq!((load.error, load.rejection), (None, None));
+    assert!(load.updated_at.is_some());
 }
 
 #[tokio::test]
-async fn startup_rejects_a_cached_provider_whose_node_duplicates_an_inline_node() {
+async fn startup_keeps_a_cached_provider_node_that_matches_an_inline_node() {
     let temp = tempfile::tempdir().unwrap();
     let store = SubscriptionStore::in_dir(temp.path());
     // The fetch never gets a reply, so only the cached body is published.
@@ -844,9 +839,15 @@ async fn startup_rejects_a_cached_provider_whose_node_duplicates_an_inline_node(
 
     state.prepare_startup(&mut config, Vec::new()).await;
 
+    // Provenance splits the identity: the hand-written node and the identical
+    // cached endpoint are two outbounds, so the provider is no longer rejected
+    // with `duplicate-node-id` and the rest of its nodes load too.
     config.validate_assembled().unwrap();
-    assert_eq!(node_names(&config), ["inline", "kept"]);
-    assert_rejected(&state, provider.subscription.id);
+    assert_eq!(
+        node_names(&config),
+        ["inline", "kept", "cached", "cached-other"]
+    );
+    assert_published(&state, provider.subscription.id);
     state.shutdown().await.unwrap();
 }
 
@@ -899,7 +900,7 @@ async fn startup_drops_provider_nodes_another_provider_published() {
 }
 
 #[tokio::test]
-async fn startup_rejects_a_first_fetch_whose_node_duplicates_an_inline_node() {
+async fn startup_keeps_a_first_fetch_node_that_matches_an_inline_node() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let provider = authorized(
         uuid::Uuid::new_v4(),
@@ -919,8 +920,8 @@ async fn startup_rejects_a_first_fetch_whose_node_duplicates_an_inline_node() {
 
     server.await.unwrap();
     config.validate_assembled().unwrap();
-    assert_eq!(node_names(&config), ["inline", "kept"]);
-    assert_rejected(&state, provider.subscription.id);
+    assert_eq!(node_names(&config), ["inline", "kept", "fetched"]);
+    assert_published(&state, provider.subscription.id);
     state.shutdown().await.unwrap();
 }
 

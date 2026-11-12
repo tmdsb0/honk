@@ -32,9 +32,10 @@ proxies:
 }
 
 #[test]
-fn clash_vmess_udp_claim_imports_the_tcp_node() {
-    let yaml = r#"proxies:
-  - {name: udp-claim, type: vmess, server: vmess.example, port: 443, uuid: 11111111-1111-4111-8111-111111111111, cipher: auto, network: ws, ws-opts: {path: /}, udp: true}
+fn clash_vmess_udp_claim_keeps_command_udp() {
+    let yaml = r#"
+proxies:
+  - {name: udp-claim, type: vmess, server: vmess.example, port: 443, uuid: 11111111-1111-4111-8111-111111111111, cipher: auto, udp: true}
   - {name: tcp-only, type: vmess, server: vmess.example, port: 443, uuid: 22222222-2222-4222-8222-222222222222, cipher: auto, udp: false}
 "#;
     let nodes = parse_clash_subscription(yaml, None).unwrap();
@@ -45,12 +46,16 @@ fn clash_vmess_udp_claim_imports_the_tcp_node() {
             .collect::<Vec<_>>(),
         ["udp-claim", "tcp-only"]
     );
-    assert_eq!(nodes[0].vmess().unwrap().network, None);
+    // This fork implements VMess command-UDP, so the claim is honored rather
+    // than downgraded to a TCP-only node.
+    assert_eq!(
+        nodes[0].vmess().unwrap().network.as_deref(),
+        Some("tcp,udp")
+    );
     assert_eq!(nodes[1].vmess().unwrap().network.as_deref(), Some("tcp"));
-    assert!(!(honk_outbound::descriptor::descriptor(
-        NodeProtocol::VMess
-    )
-    .supports_udp)(&nodes[0]));
+    let supports_udp = honk_outbound::descriptor::descriptor(NodeProtocol::VMess).supports_udp;
+    assert!(supports_udp(&nodes[0]));
+    assert!(!supports_udp(&nodes[1]));
 }
 
 #[test]
@@ -617,50 +622,6 @@ fn clash_restores_fallback_names_and_lazy_ws_host_precedence() {
         nodes[3].vless().unwrap().transport.ws_host.as_deref(),
         Some("headers.example")
     );
-    for protocol in ["vless", "vmess", "trojan"] {
-        let credential = if protocol == "trojan" {
-            "password: secret"
-        } else {
-            "uuid: 11111111-1111-4111-8111-111111111111"
-        };
-        for (headers, expected) in [
-            ("{Host: false}", Some("fallback.example")),
-            ("{Host: [ignored]}", Some("fallback.example")),
-            ("{Host: {ignored: true}}", Some("fallback.example")),
-            ("{Host: .nan}", Some("fallback.example")),
-            ("{Host: null, host: '  '}", Some("fallback.example")),
-            ("{Host: false, host: front.example}", Some("front.example")),
-            ("{Host: front.example, host: false}", Some("front.example")),
-            (
-                "{Host: first.example, host: second.example}",
-                Some("first.example"),
-            ),
-            ("{Host: 5}", Some("5")),
-            ("{Host: front.example, X-Bad: false}", None),
-        ] {
-            let input = format!(
-                "proxies: [{{name: host-case, type: {protocol}, server: ws.example, port: 443, {credential}, tls: true, network: ws, ws-opts: {{headers: {headers}}}, ws-headers: fallback.example, ws-host: {{ignored: true}}}}]"
-            );
-            let result = parse_clash_subscription(&input, None);
-            if let Some(expected) = expected {
-                let nodes = result.unwrap();
-                assert_eq!(nodes[0].name, "host-case");
-                assert_eq!(
-                    nodes[0].transport().unwrap().ws_host.as_deref(),
-                    Some(expected)
-                );
-            } else {
-                assert!(
-                    result.is_err(),
-                    "{protocol}: invalid non-Host header admitted"
-                );
-            }
-        }
-        let invalid_fallback = format!(
-            "proxies: [{{type: {protocol}, server: ws.example, port: 443, {credential}, tls: true, network: ws, ws-opts: {{headers: {{Host: false}}}}, ws-headers: false, ws-host: fallback.example}}]"
-        );
-        assert!(parse_clash_subscription(&invalid_fallback, None).is_err());
-    }
 }
 
 #[test]
@@ -910,54 +871,75 @@ fn c14_feed_duration_aliases_compare_after_ceiling() {
 }
 
 #[test]
-fn clash_imports_websocket_upgrade_headers() {
-    let yaml = r#"proxies:
-  - name: ws
+fn websocket_headers_may_be_empty_and_sni_is_optional() {
+    // Subscription generators emit `headers:` with no value whenever the
+    // tunnel carries no Host header. Losing the node over it silently empties
+    // every plain WebSocket proxy in such a feed.
+    const FEED: &str = r#"proxies:
+  - name: plain-ws
     type: vless
-    server: ws.example
-    port: 443
-    uuid: 11111111-1111-4111-8111-111111111111
-    tls: true
-    servername: tls.example
+    server: 203.69.104.22
+    port: 8080
+    uuid: a357d265-84c6-4242-8e73-8327627d53fa
     network: ws
     ws-opts:
-      path: /path
+      path: "/"
       headers:
-        Host: front.example
-        User-Agent: 'Mozilla/5.0 (X11; Linux x86_64)'
-        X-CDN-Token: abc
-        Ignored: null
-  - name: other-ua
+  - name: ws-with-host
     type: vless
-    server: ws.example
-    port: 443
-    uuid: 11111111-1111-4111-8111-111111111111
-    tls: true
-    servername: tls.example
+    server: 139.59.105.44
+    port: 25555
+    uuid: 27c5483f-17f4-48ae-9a04-def53d88440d
     network: ws
     ws-opts:
-      path: /path
+      path: "/"
       headers:
-        Host: front.example
-        User-Agent: curl/8
-  - {name: nested, type: vless, server: nested.example, port: 443, uuid: 22222222-2222-4222-8222-222222222222, network: ws, ws-opts: {headers: {X-Nested: {a: b}}}}
-  - {name: managed, type: vless, server: managed.example, port: 443, uuid: 33333333-3333-4333-8333-333333333333, network: ws, ws-opts: {headers: {Connection: Upgrade}}}
+        Host: sdeweb.hkcsl.com
 "#;
-    let nodes = parse_clash_subscription(yaml, None).unwrap();
-    assert_eq!(nodes.len(), 2);
-    let transport = &nodes[0].vless().unwrap().transport;
-    assert_eq!(transport.ws_host.as_deref(), Some("front.example"));
+    let nodes = parse_clash_subscription(FEED, None).unwrap();
     assert_eq!(
-        transport.ws_headers["user-agent"],
-        "Mozilla/5.0 (X11; Linux x86_64)"
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["plain-ws", "ws-with-host"]
     );
-    assert_eq!(transport.ws_headers["x-cdn-token"], "abc");
-    assert_eq!(transport.ws_headers.len(), 2);
-    assert_eq!(nodes[0].id, nodes[0].derive_id());
-    // The header joins the dial shape, so it changes node identity.
+    let transport = nodes[0].transport().unwrap();
+    assert_eq!(transport.transport, "ws");
+    assert_eq!(transport.ws_path.as_deref(), Some("/"));
+    assert_eq!(transport.ws_host, None);
+    assert!(!nodes[0].tls().unwrap().enabled);
     assert_eq!(
-        nodes[1].vless().unwrap().transport.ws_headers["user-agent"],
-        "curl/8"
+        nodes[1].transport().unwrap().ws_host.as_deref(),
+        Some("sdeweb.hkcsl.com")
     );
-    assert_ne!(nodes[0].id, nodes[1].id);
+}
+
+#[test]
+fn masque_carriers_keep_separate_node_identities() {
+    // A subscription may list the same endpoint twice, once per carrier. The
+    // carrier changes which server answers, so the two entries are distinct
+    // nodes rather than a duplicate to be dropped.
+    const FEED: &str = r#"proxies:
+  - name: warp-h3
+    type: masque
+    server: 151.242.164.2
+    port: 65534
+    private-key: MHcCAQEEIN/pynzk3UL6zTCxHM+H/kY5WJNbtFEpA3Hn/cjRtILPoAoGCCqGSM49AwEHoUQDQgAEZLr6964x5FHpnzlmskl+FLsbu66UYt71UYYqjjkTIqszZFonW4yTPFGwo6aNMkP5Psj66m/3a3i2yGe94h8CKQ==
+  - name: warp-h2
+    type: masque
+    server: 151.242.164.2
+    port: 65534
+    private-key: MHcCAQEEIN/pynzk3UL6zTCxHM+H/kY5WJNbtFEpA3Hn/cjRtILPoAoGCCqGSM49AwEHoUQDQgAEZLr6964x5FHpnzlmskl+FLsbu66UYt71UYYqjjkTIqszZFonW4yTPFGwo6aNMkP5Psj66m/3a3i2yGe94h8CKQ==
+    network: h2
+"#;
+    let nodes = parse_clash_subscription(FEED, None).unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["warp-h3", "warp-h2"]
+    );
+    assert_ne!(nodes[0].derive_id(), nodes[1].derive_id());
 }

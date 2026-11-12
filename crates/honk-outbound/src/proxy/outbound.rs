@@ -62,6 +62,32 @@ pub trait TcpOutbound: Send + Sync {
         .await
     }
 
+    /// Dial inside a generation, carried by a detour the caller names rather
+    /// than by the node's own.
+    ///
+    /// This is how a group's detour reaches the member it picked. A group
+    /// resolves to a node only once a flow arrives, so the front it names
+    /// could never have been bound to that node: the same node is reachable
+    /// directly, or through another group, and keeps its own path out in both
+    /// cases. The caller is therefore the only thing that knows.
+    ///
+    /// The default refuses. Honouring this means opening the node's own server
+    /// connection over the detour, which only the protocols that dial through
+    /// the shared transport do; dialling regardless would send the flow out of
+    /// the real interface while looking like an ordinary connection, which is
+    /// the one outcome a detour exists to rule out.
+    async fn dial_runtime_detoured(
+        &self,
+        _runtime: Arc<crate::runtime::NodeRuntime>,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+    ) -> anyhow::Result<ProxyStream> {
+        let _ = detour;
+        anyhow::bail!("this protocol cannot be carried by a detour a group names")
+    }
+
     /// Dial a routed direct flow with a nonzero mark. Outbounds that do not
     /// own the flow's socket cannot apply it and refuse the dial.
     async fn dial_runtime_marked(
@@ -105,6 +131,29 @@ pub trait PacketOutbound: Send + Sync {
             connect_timeout,
         )
         .await
+    }
+
+    /// UDP counterpart of [`TcpOutbound::dial_runtime_detoured`].
+    ///
+    /// A group's detour names the path this one flow must take, independent of
+    /// whatever detour the node itself carries. Reusing a session, QUIC client
+    /// or shared-source carrier opened over the node's own path would send the
+    /// packets out of that other path while looking like an ordinary flow, so
+    /// this dial must build one over the named detour instead.
+    ///
+    /// The default refuses. Silently dialling the node's own path is exactly
+    /// the leak a detour exists to rule out, so only protocols that dial
+    /// through the shared transport override this.
+    async fn dial_udp_transport_runtime_detoured(
+        &self,
+        _runtime: Arc<crate::runtime::NodeRuntime>,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+        detour: &Arc<crate::proxy::detour::DetourPath>,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let _ = detour;
+        anyhow::bail!("this protocol cannot carry a detour a group names on UDP")
     }
 
     /// UDP counterpart of [`TcpOutbound::dial_runtime_marked`].

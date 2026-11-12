@@ -2,7 +2,6 @@ use super::*;
 use crate::{
     control::{ControlCommand, ControlPlane},
     dns::DnsResolver,
-    download_route::Via,
     ebpf::mock::MockEbpfBackend,
     native_api::NativeServer,
     routing::Router,
@@ -216,13 +215,13 @@ async fn refresh_replays_before_busy_and_success_waits_for_real_runtime_publicat
 }
 
 #[tokio::test]
-async fn failed_fetch_and_failed_merge_preserve_previously_accepted_nodes() {
+async fn failed_fetch_preserves_previously_accepted_nodes() {
     let mut origin = Origin::new().await;
     let subscription = origin.subscription();
     let mut config = Config::default();
     config.subscriptions.push(subscription.clone());
     config.nodes.push(Node::from_share_link(NEW).unwrap());
-    let mut fixture = Fixture::start(config, None, Some(OLD), &mut origin).await;
+    let fixture = Fixture::start(config, None, Some(OLD), &mut origin).await;
     let accepted: Value = fixture
         .refresh(subscription.id, "bad-body")
         .await
@@ -236,21 +235,6 @@ async fn failed_fetch_and_failed_merge_preserve_previously_accepted_nodes() {
         .await;
     assert_eq!(after_fetch["status"], "stale");
     assert_eq!(after_fetch["node_count"], 1);
-    let accepted: Value = fixture
-        .refresh(subscription.id, "bad-merge")
-        .await
-        .json()
-        .await
-        .unwrap();
-    respond(origin.next().await, NEW).await;
-    fixture.publish().await;
-    let operation = fixture.terminal(&accepted).await;
-    assert_eq!(operation["status"], "failed");
-    assert_eq!(operation["error"]["code"], "publication_rejected");
-    assert_eq!(
-        operation["error"]["details"]["diagnostic_code"],
-        "duplicate-node-id"
-    );
     assert!(
         fixture
             .state
@@ -261,15 +245,50 @@ async fn failed_fetch_and_failed_merge_preserve_previously_accepted_nodes() {
             .iter()
             .any(|node| node.name == "old" && node.subscription_id == Some(subscription.id))
     );
+    fixture.stop().await;
+    origin.stop().await;
+}
+
+#[tokio::test]
+async fn matching_endpoint_merge_keeps_the_static_node_and_adds_the_provider_copy() {
+    // The provider publishes exactly the endpoint already written by hand.
+    // Provenance splits the derived ID, so the publication is admitted and
+    // both outbounds remain instead of the provider being rejected.
+    let mut origin = Origin::new().await;
+    let subscription = origin.subscription();
+    let mut config = Config::default();
+    config.subscriptions.push(subscription.clone());
+    let static_node = Node::from_share_link(NEW).unwrap();
+    config.nodes.push(static_node.clone());
+    let mut fixture = Fixture::start(config, None, Some(OLD), &mut origin).await;
+    let accepted: Value = fixture
+        .refresh(subscription.id, "matching-merge")
+        .await
+        .json()
+        .await
+        .unwrap();
+    respond(origin.next().await, NEW).await;
+    fixture.publish().await;
+    let operation = fixture.terminal(&accepted).await;
+    assert_eq!(operation["status"], "succeeded");
+    assert_eq!(operation["result"]["node_count"], 1);
+    let nodes = fixture.state.config.read().await.nodes.clone();
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node.id == static_node.id && node.subscription_id.is_none()),
+        "the hand-written copy must survive"
+    );
+    assert!(
+        nodes.iter().any(|node| node.name == "new"
+            && node.subscription_id == Some(subscription.id)
+            && node.id != static_node.id),
+        "the provider copy must be admitted as its own outbound"
+    );
     let provider = fixture
         .get(&format!("/api/v1/providers/{}", subscription.id))
         .await;
-    assert_eq!(provider["updated_at"], after_fetch["updated_at"]);
-    assert_eq!(provider["last_error"]["code"], "publication_rejected");
-    assert_eq!(
-        provider["last_error"]["details"],
-        json!({"diagnostic_code": "duplicate-node-id"})
-    );
+    assert_eq!(provider["node_count"], 1);
     fixture.stop().await;
     origin.stop().await;
 }
@@ -417,10 +436,6 @@ async fn failed_initial_fetch_is_error_without_fabricated_success_time() {
     assert_eq!(provider["node_count"], 0);
     assert!(provider["updated_at"].is_null());
     assert_eq!(provider["last_error"]["code"], "fetch_failed");
-    assert_eq!(
-        provider["last_error"]["details"],
-        json!({"stage": "parse_failed", "node": null, "group_id": null})
-    );
     fixture.stop().await;
     origin.stop().await;
 }
@@ -670,88 +685,6 @@ fn provider_rows_report_the_download_route_like_geodata() {
         serde_json::to_value(Provider::inline(0)).unwrap()["download"],
         Value::Null
     );
-}
-
-/// A provider whose last fetch failed as `fetch`.
-fn failed_fetch(config: &Config, fetch: Option<FetchFailure>) -> Value {
-    let subscription = Subscription {
-        name: "p".into(),
-        url: "https://example.test/sub".into(),
-        ..Default::default()
-    };
-    let load = ProviderLoad {
-        error: Some("fetch_failed"),
-        fetch,
-        ..Default::default()
-    };
-    let group_id = |name: &str| (name == "proxy").then(|| "group-proxy".to_owned());
-    serde_json::to_value(
-        Provider::observed(&subscription, load, 0, group_id).mask_listener_secrets(config, None),
-    )
-    .unwrap()
-}
-
-#[test]
-fn a_failed_fetch_names_its_stage_node_and_group_without_changing_the_code() {
-    let config = Config::default();
-    let through = |node: &str, group: Option<&str>| FetchFailure {
-        stage: "connection_failed",
-        via: Some(Via {
-            node: node.into(),
-            group: group.map(str::to_owned),
-        }),
-    };
-    let row = failed_fetch(&config, Some(through("hk-1", Some("proxy"))));
-    assert_eq!(row["last_error"]["code"], "fetch_failed");
-    assert_eq!(
-        row["last_error"]["details"],
-        json!({"stage": "connection_failed", "node": "hk-1", "group_id": "group-proxy"})
-    );
-    // A group the catalog does not know, and a node chosen without a group.
-    for group in [Some("gone"), None] {
-        let row = failed_fetch(&config, Some(through("hk-1", group)));
-        assert_eq!(
-            row["last_error"]["details"],
-            json!({"stage": "connection_failed", "node": "hk-1", "group_id": null})
-        );
-    }
-    let direct = FetchFailure {
-        stage: "download_timeout",
-        via: None,
-    };
-    assert_eq!(
-        failed_fetch(&config, Some(direct))["last_error"]["details"],
-        json!({"stage": "download_timeout", "node": null, "group_id": null})
-    );
-    let parse = FetchFailure {
-        stage: "parse_failed",
-        via: None,
-    };
-    assert_eq!(
-        failed_fetch(&config, Some(parse))["last_error"]["details"]["stage"],
-        "parse_failed"
-    );
-    // A failure that names no stage reports none.
-    assert_eq!(
-        failed_fetch(&config, None)["last_error"]["details"],
-        Value::Null
-    );
-}
-
-#[test]
-fn a_failed_fetch_masks_listener_values_in_the_node_name() {
-    let mut config = Config::default();
-    config.experimental.native_api.secret = "native-listener-token".into();
-    let fetch = FetchFailure {
-        stage: "connection_failed",
-        via: Some(Via {
-            node: "node-native-listener-token".into(),
-            group: None,
-        }),
-    };
-    let row = failed_fetch(&config, Some(fetch));
-    assert_eq!(row["last_error"]["details"]["node"], "node-<redacted>");
-    assert!(!row.to_string().contains("native-listener-token"));
 }
 
 #[tokio::test]

@@ -294,11 +294,23 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for RelayIo<S> {
 /// [`splice::DRAIN_DEADLINE`] for why the drain must be bounded.
 const DRAIN_DEADLINE: std::time::Duration = splice::DRAIN_DEADLINE;
 
-// A saturated read fits one AnyTLS frame without a one-byte tail.
-const RELAY_BUF_SIZE: usize = u16::MAX as usize;
 // Idle and chatty flows keep this small buffer; one saturated read marks a
-// bulk flow, which uses the full frame size for the rest of its life.
+// bulk flow, which then uses the largest chunk a framed outbound can take in a
+// single write for the rest of its life.
+//
+// This is a syscall/task-wakeup knob, not a window. The loop below is strictly
+// serial — read, `write_all`, read — so its pipeline depth is one at any buffer
+// size and a flow's throughput is set by the two TCP windows. Growing the chunk
+// past one protocol frame cannot help, and hurts: `AnyTLS` truncates every
+// `poll_write` to `u16::MAX` and `Trojan` refuses anything larger, so a 1 MiB
+// chunk would be split into sixteen frames with a permit acquisition each.
 const RELAY_BUF_MIN: usize = 8 * 1024;
+
+/// Upper bound for one copy buffer: one protocol frame at most, never below
+/// the small idle buffer.
+fn relay_buf_max() -> usize {
+    honk_config::tuning::relay_copy_chunk().max(RELAY_BUF_MIN)
+}
 
 /// Stops both copy directions where neither holds unwritten bytes, so the
 /// relay can hand the connection to another engine without cancelling a
@@ -360,6 +372,7 @@ where
     // relay starts, independently of bytes read by this copy loop.
     wr.flush().await.map_err(write_error)?;
     let mut rd = RelayIo::wrap(rd, progress, None, None, None, false);
+    let max_buffer = relay_buf_max();
     let mut buffer = vec![0; RELAY_BUF_MIN];
     let mut n = 0;
     loop {
@@ -395,8 +408,8 @@ where
         }
         wr.write_all(&buffer[..read]).await.map_err(write_error)?;
         n += read as u64;
-        if read == buffer.len() && read < RELAY_BUF_SIZE {
-            buffer = vec![0; RELAY_BUF_SIZE];
+        if read == buffer.len() && read < max_buffer {
+            buffer = vec![0; max_buffer];
         }
     }
     wr.flush().await.map_err(write_error)?;
@@ -605,7 +618,7 @@ mod tests {
                 assert!(
                     sizes[1..sizes.len() - 1]
                         .iter()
-                        .all(|&size| size == RELAY_BUF_SIZE),
+                        .all(|&size| size == relay_buf_max().min(limit)),
                     "saturated data must not fragment into small frames: {sizes:?}"
                 );
             }
@@ -664,7 +677,7 @@ mod tests {
         let bulk = offered_room(&[FILL, 100, 100]).await;
         assert_eq!(bulk[0], RELAY_BUF_MIN);
         assert!(
-            bulk[1..].iter().all(|&room| room == RELAY_BUF_SIZE),
+            bulk[1..].iter().all(|&room| room == relay_buf_max()),
             "{bulk:?}"
         );
     }

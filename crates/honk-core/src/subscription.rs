@@ -64,8 +64,8 @@ struct IndexedOutcome {
 #[derive(Debug)]
 enum IndexedOutcomeKind {
     Node(Node),
-    Malformed((Option<&'static str>, &'static str)),
-    Unsupported((Option<&'static str>, &'static str)),
+    Malformed(&'static str),
+    Unsupported(&'static str),
     Profile(&'static str),
     Diagnostic(DetailedDiagnostic),
 }
@@ -80,32 +80,12 @@ impl IndexedOutcome {
         }
     }
 
-    fn parsed(
-        ordinal: usize,
-        path: &'static str,
-        result: Result<Node, (Option<&'static str>, &'static str)>,
-    ) -> Self {
-        match result {
-            Ok(node) => Self::node(ordinal, path, node),
-            Err(error @ (_, reason)) => Self {
-                ordinal,
-                line: None,
-                path,
-                kind: if reason.contains("unsupported") {
-                    IndexedOutcomeKind::Unsupported(error)
-                } else {
-                    IndexedOutcomeKind::Malformed(error)
-                },
-            },
-        }
-    }
-
     fn malformed(ordinal: usize, path: &'static str, reason: &'static str) -> Self {
         Self {
             ordinal,
             line: None,
             path,
-            kind: IndexedOutcomeKind::Malformed((None, reason)),
+            kind: IndexedOutcomeKind::Malformed(reason),
         }
     }
 
@@ -114,7 +94,7 @@ impl IndexedOutcome {
             ordinal,
             line: None,
             path,
-            kind: IndexedOutcomeKind::Unsupported((None, reason)),
+            kind: IndexedOutcomeKind::Unsupported(reason),
         }
     }
 
@@ -179,10 +159,7 @@ impl<'a> AdmissionOwner<'a> {
                         ordinal,
                         line,
                         path,
-                        (
-                            None,
-                            "subscription node uses an unsupported proxy plugin; ignored",
-                        ),
+                        "subscription node uses an unsupported proxy plugin; ignored",
                     );
                 } else if let Some(first) = self.seen.get(&node.id).copied() {
                     if self.reserve() {
@@ -203,21 +180,21 @@ impl<'a> AdmissionOwner<'a> {
                     self.nodes.push(node);
                 }
             }
-            IndexedOutcomeKind::Malformed(error) => self.emit_indexed(
+            IndexedOutcomeKind::Malformed(reason) => self.emit_indexed(
                 "malformed-subscription-entry",
                 Severity::Warning,
                 ordinal,
                 line,
                 path,
-                error,
+                reason,
             ),
-            IndexedOutcomeKind::Unsupported(error) => self.emit_indexed(
+            IndexedOutcomeKind::Unsupported(reason) => self.emit_indexed(
                 "unsupported-subscription-entry",
                 Severity::Warning,
                 ordinal,
                 line,
                 path,
-                error,
+                reason,
             ),
             IndexedOutcomeKind::Profile(reason) => self.emit_indexed(
                 "subscription-profile-entry",
@@ -225,7 +202,7 @@ impl<'a> AdmissionOwner<'a> {
                 ordinal,
                 line,
                 path,
-                (None, reason),
+                reason,
             ),
             IndexedOutcomeKind::Diagnostic(mut diagnostic) => {
                 diagnostic.terminal = false;
@@ -252,15 +229,18 @@ impl<'a> AdmissionOwner<'a> {
         ordinal: usize,
         line: Option<usize>,
         path: &'static str,
-        (field, message): (Option<&'static str>, &'static str),
+        message: &'static str,
     ) {
         if self.reserve() {
-            let mut diagnostic =
-                indexed_diagnostic(code, severity, &self.source, ordinal, line, path, message);
-            if let Some(field) = field {
-                diagnostic.setting.0.push(SettingSegment::Field(field));
-            }
-            self.diagnostics.push(diagnostic);
+            self.diagnostics.push(indexed_diagnostic(
+                code,
+                severity,
+                &self.source,
+                ordinal,
+                line,
+                path,
+                message,
+            ));
         }
     }
 
@@ -855,6 +835,9 @@ fn parse_uri_subscription(
         match result {
             Ok(mut node) => {
                 node.subscription_id = subscription_id;
+                // Provenance is part of the node ID (see Node::derive_id), so
+                // stamping it after the share-link parse needs a re-derive.
+                node.id = node.derive_id();
                 let mut outcome = IndexedOutcome::node(ordinal, "entries", node);
                 outcome.line = Some(ordinal);
                 emit(outcome);
@@ -947,11 +930,13 @@ fn emit_clash_proxies(
             None => {
                 IndexedOutcome::malformed(ordinal, "proxies", "Clash proxy entry must be an object")
             }
-            Some(mapping) => IndexedOutcome::parsed(
-                ordinal,
-                "proxies",
-                clash::parse_clash_proxy(mapping, subscription_id, Some("h3")),
-            ),
+            Some(mapping) => match clash::parse_clash_proxy(mapping, subscription_id, Some("h3")) {
+                Ok(node) => IndexedOutcome::node(ordinal, "proxies", node),
+                Err(reason) if reason.contains("unsupported") => {
+                    IndexedOutcome::unsupported(ordinal, "proxies", reason)
+                }
+                Err(reason) => IndexedOutcome::malformed(ordinal, "proxies", reason),
+            },
         };
         emit(outcome);
     }

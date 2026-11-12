@@ -54,6 +54,9 @@ fn supports_tls(protocol: NodeProtocol) -> bool {
             | NodeProtocol::Tuic
             | NodeProtocol::Juicity
             | NodeProtocol::AnyTLS
+            // MASQUE is always TLS: the carrier is HTTP/2 or HTTP/3, and the
+            // SNI is where the decoy hostname lives.
+            | NodeProtocol::Masque
     )
 }
 
@@ -117,6 +120,8 @@ fn protocol_from_name(proxy_type: &str) -> Result<NodeProtocol, &'static str> {
         Ok(NodeProtocol::Juicity)
     } else if proxy_type.eq_ignore_ascii_case("anytls") {
         Ok(NodeProtocol::AnyTLS)
+    } else if proxy_type.eq_ignore_ascii_case("masque") {
+        Ok(NodeProtocol::Masque)
     } else {
         Err("unsupported proxy type")
     }
@@ -175,7 +180,11 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
     reject_active_unless(
         mapping,
         &["network"],
-        supports_stream(protocol) || protocol == NodeProtocol::AnyTLS,
+        // MASQUE's network picks the carrier (h2 or quic), not a stream
+        // transport, but it is spelled the same way.
+        supports_stream(protocol)
+            || protocol == NodeProtocol::AnyTLS
+            || protocol == NodeProtocol::Masque,
         "network settings are unsupported for this protocol",
     )?;
     reject_active_unless(
@@ -214,12 +223,29 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
     }
 
     let udp = yaml_bool_alias(mapping, &["udp"])?;
-    // VMess has no UDP path: `udp: true` there is a capability claim honk
-    // cannot honor, not a restriction, so the node still imports for TCP.
+    let udp_capable = matches!(
+        protocol,
+        NodeProtocol::SS
+            | NodeProtocol::Trojan
+            // This fork implements VMess command-UDP, so `udp: true` is a
+            // real capability claim rather than an unsupported one.
+            | NodeProtocol::VMess
+            | NodeProtocol::VLess
+            | NodeProtocol::Socks5
+            | NodeProtocol::Hysteria2
+            | NodeProtocol::Tuic
+            | NodeProtocol::Juicity
+            | NodeProtocol::AnyTLS
+            // MASQUE carries IP packets, so UDP is just another flow.
+            | NodeProtocol::Masque
+    );
     let udp_restrictable = matches!(
         protocol,
         NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess | NodeProtocol::AnyTLS
     );
+    if udp == Some(true) && !udp_capable {
+        return Err("UDP capability is unsupported for this protocol");
+    }
     if udp == Some(false) && !udp_restrictable {
         return Err("UDP restriction is unsupported for this protocol");
     }
@@ -259,7 +285,9 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
         protocol == NodeProtocol::Hysteria2,
         "Hysteria2 MTU discovery options are unsupported",
     )?;
+    // MASQUE shares the `mtu` key with the QUIC protocols: it sizes its TUN.
     if !supports_quic(protocol)
+        && protocol != NodeProtocol::Masque
         && (has_active(mapping, QUIC_MTU_KEYS)
             || has_active(mapping, STREAM_WINDOW_KEYS)
             || has_active(mapping, CONN_WINDOW_KEYS))
@@ -284,6 +312,8 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
             | NodeProtocol::Tuic
             | NodeProtocol::Juicity
             | NodeProtocol::AnyTLS
+            // MASQUE's carrier is HTTP/2 or HTTP/3, so TLS is not optional.
+            | NodeProtocol::Masque
     );
     let tls_enabled = tls_explicit.unwrap_or(mandatory_tls);
     if mandatory_tls && !tls_enabled {
@@ -375,6 +405,23 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
             config.idle_session_timeout =
                 yaml_duration_alias(mapping, &["idle-session-timeout", "idle_session_timeout"])?;
         }
+        OutboundConfig::Masque(config) => {
+            config.network = yaml_text_alias(mapping, &["network"])?;
+            config.private_key = yaml_text_alias(mapping, &["private-key", "private_key"])?;
+            config.endpoint_public_key = yaml_text_alias(mapping, &["public-key", "public_key"])?;
+            config.local_ipv4 = yaml_text_alias(mapping, &["ip", "local-ipv4"])?;
+            config.local_ipv6 = yaml_text_alias(mapping, &["ipv6", "local-ipv6"])?;
+            config.mtu = yaml_u64_alias(mapping, &["mtu"])?
+                .map(|value| u16::try_from(value).map_err(|_| "masque mtu is too large"))
+                .transpose()?;
+            config.remote_dns_resolve =
+                yaml_bool_alias(mapping, &["remote-dns-resolve", "remote_dns_resolve"])?
+                    .unwrap_or(false);
+            config.dns = match yaml_alias(mapping, &["dns"])? {
+                Some(value) => fields::alpn_list(value)?,
+                None => Vec::new(),
+            };
+        }
         OutboundConfig::Direct | OutboundConfig::Block => unreachable!(),
     }
     Ok(())
@@ -428,9 +475,7 @@ fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result
             let network = if udp { "tcp,udp" } else { "tcp" }.to_string();
             match &mut node.outbound {
                 OutboundConfig::Trojan(config) => config.network = Some(network),
-                // VMess has no UDP path, so only an explicit restriction is
-                // representable; `udp: true` keeps the TCP node as-is.
-                OutboundConfig::Vmess(config) if !udp => config.network = Some(network),
+                OutboundConfig::Vmess(config) => config.network = Some(network),
                 OutboundConfig::Vless(config) => config.network = Some(network),
                 _ => {}
             }
@@ -462,25 +507,28 @@ fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result
         if let Some(options) = yaml_value(mapping, "ws-opts").filter(|value| yaml_active(value)) {
             let options = options.as_mapping().ok_or("ws-opts must be a mapping")?;
             transport.ws_path = yaml_text_alias(options, &["path"])?;
-            if let Some(headers) = yaml_value(options, "headers") {
+            // Generators emit a dangling `headers:` key with no value whenever
+            // the tunnel carries none. It is an empty header set, not a
+            // malformed one, and rejecting it drops the whole node.
+            if let Some(headers) = yaml_value(options, "headers").filter(|value| yaml_active(value))
+            {
                 let headers = headers
                     .as_mapping()
                     .ok_or("ws-opts.headers must be a mapping")?;
-                let mut ws_host = None;
                 for (key, value) in headers {
                     let key = key.as_str().ok_or("websocket header name is invalid")?;
-                    if key.eq_ignore_ascii_case("host") {
-                        if ws_host.is_none() {
-                            ws_host = yaml_text(value)
-                                .ok()
-                                .flatten()
-                                .filter(|value| !value.trim().is_empty());
-                        }
-                    } else if let Some(value) = yaml_text(value)? {
-                        transport.ws_headers.insert(key.to_owned(), value);
+                    if !key.eq_ignore_ascii_case("host")
+                        && !matches!(value, serde_yaml::Value::Null)
+                    {
+                        return Err("unsupported websocket header");
                     }
                 }
-                transport.ws_host = ws_host;
+                transport.ws_host = headers.iter().find_map(|(key, value)| {
+                    key.as_str()
+                        .filter(|key| key.eq_ignore_ascii_case("host"))
+                        .and_then(|_| yaml_text(value).ok().flatten())
+                        .filter(|value| !value.trim().is_empty())
+                });
             }
         }
         transport.ws_path = transport
@@ -692,8 +740,7 @@ pub(super) fn parse_clash_proxy(
     mapping: &Mapping,
     subscription_id: Option<uuid::Uuid>,
     tuic_default_alpn: Option<&str>,
-) -> Result<Node, (Option<&'static str>, &'static str)> {
-    let entry_error = |message| (None, message);
+) -> Result<Node, &'static str> {
     let ProxySource {
         protocol,
         name,
@@ -702,7 +749,7 @@ pub(super) fn parse_clash_proxy(
         udp,
         tls_explicit,
         tls_enabled,
-    } = validate_source(mapping).map_err(entry_error)?;
+    } = validate_source(mapping)?;
     let mut node = Node {
         name,
         address: format!("{server}:{port}"),
@@ -713,18 +760,24 @@ pub(super) fn parse_clash_proxy(
         ..Default::default()
     };
 
-    apply_protocol(mapping, &mut node).map_err(entry_error)?;
-    apply_stream(mapping, &mut node, udp).map_err(entry_error)?;
-    apply_tls(mapping, &mut node, protocol, tls_explicit, tls_enabled).map_err(entry_error)?;
-    apply_quic(mapping, &mut node, tuic_default_alpn).map_err(entry_error)?;
-    node.normalize_stream_transport()
-        .map_err(|(field, message)| (Some(field), message))?;
+    apply_protocol(mapping, &mut node)?;
+    // A detour belongs to the path, not to the protocol: mihomo spells it
+    // `dialer-proxy`, sing-box `detour`. Every protocol reads it here, so a
+    // MASQUE node keeps exactly the behaviour it had when the field lived in
+    // its own config, and the other protocols pick it up as the shared dial
+    // entry point lands.
+    node.detour = yaml_text_alias(mapping, &["dialer-proxy", "dialer_proxy", "detour"])?
+        .filter(|value| !value.trim().is_empty());
+    apply_stream(mapping, &mut node, udp)?;
+    apply_tls(mapping, &mut node, protocol, tls_explicit, tls_enabled)?;
+    apply_quic(mapping, &mut node, tuic_default_alpn)?;
+    node.normalize_stream_transport()?;
     if let Some(config) = node.vless_mut() {
         config.normalize();
     }
-    validate_imported_node(&node).map_err(entry_error)?;
+    validate_imported_node(&node)?;
     node.validate()
-        .map_err(|_| (None, "invalid imported node protocol settings"))?;
+        .map_err(|_| "invalid imported node protocol settings")?;
     node.id = node.derive_id();
     Ok(node)
 }

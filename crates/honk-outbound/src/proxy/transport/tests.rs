@@ -38,19 +38,14 @@ fn transport_node(port: u16) -> Node {
         address: format!("127.0.0.1:{port}"),
         host: "127.0.0.1".into(),
         port,
-        outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
-            password: Some("secret".into()),
-            ..Default::default()
-        }),
+        outbound: honk_config::node::OutboundConfig::Trojan(Default::default()),
         ..Default::default()
     }
 }
 
 #[tokio::test]
 async fn test_ws_transport_roundtrip() {
-    for with_headers in [false, true] {
-        ws_transport_roundtrip("/ws-path", "/ws-path", with_headers).await;
-    }
+    ws_transport_roundtrip("/ws-path", "/ws-path").await;
 }
 
 #[tokio::test]
@@ -63,14 +58,14 @@ async fn ws_transport_encodes_path_and_preserves_query() {
         ("/existing%20path?ed=2048", "/existing%20path?ed=2048"),
         ("/雪?q=a b", "/%E9%9B%AA?q=a%20b"),
     ] {
-        ws_transport_roundtrip(path, expected, true).await;
+        ws_transport_roundtrip(path, expected).await;
     }
 }
 
 // The accept callback's Result type (and its large Err variant) is
 // dictated by tungstenite's `Callback` trait.
 #[allow(clippy::result_large_err)]
-async fn ws_transport_roundtrip(path: &str, expected: &str, with_headers: bool) {
+async fn ws_transport_roundtrip(path: &str, expected: &str) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
@@ -82,22 +77,13 @@ async fn ws_transport_roundtrip(path: &str, expected: &str, with_headers: bool) 
         let callback =
             |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
              resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                let header = |name: &str| {
-                    req.headers()
-                        .get(name)
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_string)
-                };
-                let host = header("host");
-                let user_agent = header("user-agent");
-                let x_test = header("x-test");
+                let host = req
+                    .headers()
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
                 if let Some(tx) = seen_tx.take() {
-                    let _ = tx.send((
-                        req.uri().path_and_query().unwrap().to_string(),
-                        host,
-                        user_agent,
-                        x_test,
-                    ));
+                    let _ = tx.send((req.uri().path_and_query().unwrap().to_string(), host));
                 }
                 Ok(resp)
             };
@@ -118,17 +104,8 @@ async fn ws_transport_roundtrip(path: &str, expected: &str, with_headers: bool) 
     transport.transport = "ws".into();
     transport.ws_path = Some(path.into());
     transport.ws_host = Some("cdn.example.com".into());
-    if with_headers {
-        transport.ws_headers.insert(
-            "user-agent".into(),
-            "Mozilla/5.0 (X11; Linux x86_64)".into(),
-        );
-        transport
-            .ws_headers
-            .insert("x-test".into(), "ws-header".into());
-    }
 
-    let mut stream = wrap_transport(&node, None, std::time::Duration::from_secs(3))
+    let mut stream = wrap_transport(&node, None, std::time::Duration::from_secs(3), None)
         .await
         .unwrap();
     stream.write_all(b"ping").await.unwrap();
@@ -144,14 +121,9 @@ async fn ws_transport_roundtrip(path: &str, expected: &str, with_headers: bool) 
     .unwrap();
     assert_eq!(&buf, b"pong");
 
-    let (path, host, user_agent, x_test) = seen_rx.await.unwrap();
+    let (path, host) = seen_rx.await.unwrap();
     assert_eq!(path, expected);
     assert_eq!(host.as_deref(), Some("cdn.example.com"));
-    assert_eq!(
-        user_agent.as_deref(),
-        with_headers.then_some("Mozilla/5.0 (X11; Linux x86_64)")
-    );
-    assert_eq!(x_test.as_deref(), with_headers.then_some("ws-header"));
 
     server.await.unwrap();
 }

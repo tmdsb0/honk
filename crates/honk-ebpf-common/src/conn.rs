@@ -124,10 +124,11 @@ pub enum BpfStatsKey {
     TcpPublisherClaimFailure = 6,
     NewFlowRateLimited = 7,
     UdpReverseLearningSuspended = 8,
+    FragmentVerdictInsertFailure = 9,
 }
 
 impl BpfStatsKey {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::UdpConnOverflow,
         Self::TcpConnOverflow,
         Self::RedirectTrackInsertFailure,
@@ -137,6 +138,7 @@ impl BpfStatsKey {
         Self::TcpPublisherClaimFailure,
         Self::NewFlowRateLimited,
         Self::UdpReverseLearningSuspended,
+        Self::FragmentVerdictInsertFailure,
     ];
     pub const COUNT: u32 = Self::ALL.len() as u32;
 
@@ -151,6 +153,7 @@ impl BpfStatsKey {
             Self::TcpPublisherClaimFailure => "tcp_publisher_claim_failure",
             Self::NewFlowRateLimited => "new_flow_rate_limited",
             Self::UdpReverseLearningSuspended => "udp_reverse_learning_suspended",
+            Self::FragmentVerdictInsertFailure => "fragment_verdict_insert_failure",
         }
     }
 }

@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use honk_config::node::Node;
 use tracing::debug;
 
+use crate::proxy::detour::DetourPath;
 use crate::quic::{QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact};
 use crate::transport_quality::TransportQuality;
 
@@ -183,7 +184,9 @@ impl JuicityHandler {
         &self,
         node: &Node,
         profiles: Option<Arc<crate::quic::AdaptiveFlowProfiles>>,
+        detour: Option<&Arc<DetourPath>>,
     ) -> anyhow::Result<Arc<JuicityClient>> {
+        crate::proxy::detour::ensure_bound(node, detour.map(Arc::as_ref))?;
         let juicity = node.juicity().unwrap();
         let uuid_str = juicity
             .uuid
@@ -219,6 +222,7 @@ impl JuicityHandler {
         Ok(Arc::new(JuicityClient {
             quic: QuicClient::new(node.host().to_string(), node.port, server_name, config)
                 .with_flow_control_profiles(profiles)
+                .with_detour(detour.cloned())
                 .with_max_udp_payload_size(juicity.quic.mtu.unwrap_or(1252)),
             uuid: *uuid.as_bytes(),
             password,
@@ -257,8 +261,11 @@ impl JuicityHandler {
         runtime: &crate::runtime::NodeRuntime,
     ) -> anyhow::Result<Arc<JuicityClient>> {
         let profiles = runtime.quic_flow_control_profiles()?;
+        let detour = runtime.detour();
         runtime
-            .quic_client(|| self.build_client(runtime.node.as_ref(), Some(profiles)))
+            .quic_client(|| {
+                self.build_client(runtime.node.as_ref(), Some(profiles), detour.as_ref())
+            })
             .await
     }
 
@@ -359,7 +366,11 @@ impl JuicityHandler {
         }
         let profiles = runtime.quic_flow_control_profiles()?;
         let client = self
-            .build_client(runtime.node.as_ref(), Some(profiles))
+            .build_client(
+                runtime.node.as_ref(),
+                Some(profiles),
+                runtime.detour().as_ref(),
+            )
             .await?;
         super::prepare_detached_quic_transport(runtime, client, |client| async move {
             let transport = self
@@ -404,7 +415,7 @@ impl TcpOutbound for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let client = self.build_client(node, None).await?;
+        let client = self.build_client(node, None, None).await?;
         self.dial_via_client(client, target, target_domain, connect_timeout)
             .await
     }
@@ -419,6 +430,28 @@ impl TcpOutbound for JuicityHandler {
         let client = self.client_for_runtime(&runtime).await?;
         self.dial_via_client(client, target, target_domain, connect_timeout)
             .await
+    }
+
+    async fn dial_runtime_detoured(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: &Arc<DetourPath>,
+    ) -> anyhow::Result<ProxyStream> {
+        {
+            // A QUIC connection carries every flow that shares it, and the cached
+            // one was opened over the path its own caller had. A detoured dial
+            // therefore builds its own: a handshake per connection rather than a
+            // connection that belongs to somebody else's path.
+            let profiles = Some(runtime.quic_flow_control_profiles()?);
+            let client = self
+                .build_client(runtime.node.as_ref(), profiles, Some(detour))
+                .await?;
+            self.dial_via_client(client, target, target_domain, connect_timeout)
+                .await
+        }
     }
 
     async fn dial_with_tcp(
@@ -457,7 +490,7 @@ impl PacketOutbound for JuicityHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let client = self.build_client(node, None).await?;
+        let client = self.build_client(node, None, None).await?;
         Ok(self
             .udp_transport_via_client(client, target, target_domain, connect_timeout, true)
             .await?)
@@ -476,6 +509,26 @@ impl PacketOutbound for JuicityHandler {
             .await?)
     }
 
+    async fn dial_udp_transport_runtime_detoured(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: &Arc<DetourPath>,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        // A QUIC connection carries every flow that shares it, and the cached
+        // client was opened over the node's own path. Build a private client
+        // over the detour rather than borrowing one from another path.
+        let profiles = Some(runtime.quic_flow_control_profiles()?);
+        let client = self
+            .build_client(runtime.node.as_ref(), profiles, Some(detour))
+            .await?;
+        Ok(self
+            .udp_transport_via_client(client, target, target_domain, connect_timeout, true)
+            .await?)
+    }
+
     async fn dial_udp_transport_speculative_runtime(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
@@ -485,7 +538,11 @@ impl PacketOutbound for JuicityHandler {
     ) -> anyhow::Result<super::PreparedUdpTransport> {
         let profiles = runtime.quic_flow_control_profiles()?;
         let client = self
-            .build_client(runtime.node.as_ref(), Some(profiles))
+            .build_client(
+                runtime.node.as_ref(),
+                Some(profiles),
+                runtime.detour().as_ref(),
+            )
             .await?;
         super::prepare_detached_quic_transport(runtime, client, |client| async move {
             let transport = self
@@ -500,7 +557,7 @@ impl PacketOutbound for JuicityHandler {
 #[async_trait]
 impl ProbeableOutbound for JuicityHandler {
     async fn test_connectivity(&self, node: &Node) -> bool {
-        match self.build_client(node, None).await {
+        match self.build_client(node, None, None).await {
             Ok(client) => match client.connection(Duration::from_secs(5)).await {
                 Ok((conn, _)) => crate::quic::survives_auth_close_window(&conn).await,
                 Err(_) => false,

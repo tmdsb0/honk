@@ -33,10 +33,21 @@ use tracing::debug;
 
 /// Upper bound requested for one active splice direction. A live pipe owns
 /// two FDs and at most this many kernel-buffer bytes; a full-duplex relay is
-/// therefore bounded to four FDs and 128 KiB of requested pipe pages. Linux
-/// may refuse the resize, in which case `capacity` records the smaller
+/// therefore bounded to four FDs and twice this many requested pipe pages.
+/// Linux may refuse the resize, in which case `capacity` records the smaller
 /// kernel-selected value.
 const PIPE_SIZE: usize = 64 * 1024;
+
+/// Sizes the splice pipe from `global { relay_buf_size: ... }`.
+///
+/// Unlike the userspace copy loop — serial, so its chunk is not a window —
+/// splice keeps several pipe pages in flight at once. The pipe therefore does
+/// bound a direct flow at roughly `pipe / RTT`, which is why it follows the
+/// knob all the way up to the kernel's default `/proc/sys/fs/pipe-max-size`
+/// (1 MiB on stock kernels) instead of stopping at one frame.
+fn pipe_size() -> usize {
+    honk_config::tuning::relay_buf_size().clamp(PIPE_SIZE, 1024 * 1024)
+}
 
 /// Conservative capacity used only when `F_GETPIPE_SZ` itself fails.
 const DEFAULT_PIPE_SIZE: usize = 64 * 1024;
@@ -140,7 +151,7 @@ impl Pipe {
         // Best-effort: grow the pipe to reduce syscall frequency.
         let _ = nix::fcntl::fcntl(
             &write,
-            nix::fcntl::FcntlArg::F_SETPIPE_SZ(PIPE_SIZE as libc::c_int),
+            nix::fcntl::FcntlArg::F_SETPIPE_SZ(pipe_size() as libc::c_int),
         );
         let capacity = nix::fcntl::fcntl(&write, nix::fcntl::FcntlArg::F_GETPIPE_SZ)
             .ok()

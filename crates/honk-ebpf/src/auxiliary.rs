@@ -536,19 +536,27 @@ pub fn prep_redirect_to_control_plane(
             if ret != 0 {
                 return ret as i32;
             }
-            unsafe {
-                bpf_skb_store_bytes(raw_skb(ctx), 6, tail.as_ptr() as *const _, 8, 0);
+            // A failed L2 rewrite must never publish redirect state: callers
+            // treat any non-zero return from this function as TC_ACT_SHOT.
+            let ret = unsafe {
+                bpf_skb_store_bytes(raw_skb(ctx), 6, tail.as_ptr() as *const _, 8, 0)
+            };
+            if ret != 0 {
+                return ret as i32;
             }
         }
 
-        unsafe {
+        let ret = unsafe {
             bpf_skb_store_bytes(
                 raw_skb(ctx),
                 0, // offsetof(struct ethhdr, h_dest)
                 param.dae0peer_mac.as_ptr() as *const _,
                 6,
                 0,
-            );
+            )
+        };
+        if ret != 0 {
+            return ret as i32;
         }
     }
 

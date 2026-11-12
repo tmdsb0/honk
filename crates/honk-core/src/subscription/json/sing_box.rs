@@ -25,6 +25,7 @@ pub(super) fn normalize(value: Value) -> NodeResult {
         "tuic" => NodeProtocol::Tuic,
         "juicity" => NodeProtocol::Juicity,
         "anytls" => NodeProtocol::AnyTLS,
+        "masque" => NodeProtocol::Masque,
         "selector" | "urltest" | "direct" | "block" | "dns" => {
             return Ok(NormalizedEntry::Profile(
                 "sing-box non-proxy profile outbound",
@@ -39,9 +40,9 @@ pub(super) fn normalize(value: Value) -> NodeResult {
     if protocol == NodeProtocol::VLess && source.contains_key("vless_mode") {
         return Err("VLESS vless_mode was removed");
     }
-    if source.remove("detour").is_some_and(|value| active(&value)) {
-        return Err("sing-box detour chaining is unsupported");
-    }
+    let detour = source
+        .remove("detour")
+        .filter(|value| !value.is_null() && active(value));
 
     let mut proxy = Mapping::new();
     put(&mut proxy, "type", Value::String(protocol.as_str().into()));
@@ -50,6 +51,13 @@ pub(super) fn normalize(value: Value) -> NodeResult {
         &mut proxy,
         &[("tag", "name"), ("server", "server")],
     )?;
+    // A detour names the node or group this one dials through. That is a
+    // property of the path rather than of the protocol, so it rides along with
+    // the rest of the node instead of being rejected: the shared parser reads
+    // it for every protocol that carries one.
+    if let Some(value) = detour {
+        put(&mut proxy, "detour", value);
+    }
     let hopping_port = if protocol == NodeProtocol::Hysteria2 {
         normalize_server_ports(&mut source, &mut proxy)?
     } else {
@@ -76,6 +84,7 @@ pub(super) fn normalize(value: Value) -> NodeResult {
         NodeProtocol::Tuic => normalize_tuic(source, proxy),
         NodeProtocol::Juicity => normalize_juicity(source, proxy),
         NodeProtocol::AnyTLS => normalize_anytls(source, proxy),
+        NodeProtocol::Masque => normalize_masque(source, proxy),
         NodeProtocol::Direct | NodeProtocol::Block => unreachable!(),
     }
     .map(NormalizedEntry::Node)
@@ -337,6 +346,11 @@ fn normalize_anytls(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, 
     Ok(proxy)
 }
 
+fn normalize_masque(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'static str> {
+    normalize_tls(&mut source, &mut proxy)?;
+    Ok(proxy)
+}
+
 fn normalize_packet_network(source: &mut Mapping, proxy: &mut Mapping) -> Result<(), &'static str> {
     let network = match source.remove("network") {
         None | Some(Value::Null) => return Ok(()),
@@ -492,11 +506,8 @@ fn normalize_ws_transport(mut transport: Mapping, proxy: &mut Mapping) -> Result
                 {
                     return Err("duplicate sing-box WebSocket Host headers");
                 }
-            } else if !value.is_null() {
-                if !value.is_string() {
-                    return Err("sing-box WebSocket header values must be strings");
-                }
-                normalized.insert(Value::String(key.into()), value);
+            } else if active(&value) {
+                return Err("unsupported sing-box WebSocket header");
             }
         }
         if !normalized.is_empty() {

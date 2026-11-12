@@ -1027,7 +1027,7 @@ fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> Verdict {
         unsafe { (*raw_skb(ctx)).priority = (low >> 24) | (high << 8) };
     }
     // Redirected frames may still carry the original destination MAC.
-    let _ = ctx.change_type(0);
+    ctx.change_type(0).map_err(|_| TC_ACT_SHOT)?;
     if listener_l4proto == IPPROTO_UDP {
         // Without the redirect site's marker the packet reaches sk_lookup unassigned.
         let marker = unsafe { (*raw_skb(ctx)).cb[4] };
@@ -1115,26 +1115,37 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
     let dmac = entry.smac;
     let smac = entry.dmac;
     let from_wan = entry.from_wan;
-    unsafe {
+    // Both stores must succeed before redirecting: a partial or failed L2
+    // rewrite would inject a frame with a wrong/empty MAC and the conntrack
+    // state would already claim the reply.
+    let ret = unsafe {
         bpf_skb_store_bytes(
             raw_skb(ctx),
             mem::offset_of!(EthHdr, src_addr) as u32,
             smac.as_ptr() as *const _,
             6,
             0,
-        );
+        )
+    };
+    if ret != 0 {
+        return Err(TC_ACT_SHOT);
+    }
+    let ret = unsafe {
         bpf_skb_store_bytes(
             raw_skb(ctx),
             mem::offset_of!(EthHdr, dst_addr) as u32,
             dmac.as_ptr() as *const _,
             6,
             0,
-        );
+        )
+    };
+    if ret != 0 {
+        return Err(TC_ACT_SHOT);
     }
 
     let pkt_type: u32 = if from_wan != 0 { 0 } else { 1 }; // PACKET_HOST : PACKET_OTHERHOST
     let flags: u64 = if from_wan != 0 { 1 } else { 0 }; // BPF_F_INGRESS
-    let _ = ctx.skb.change_type(pkt_type);
+    ctx.skb.change_type(pkt_type).map_err(|_| TC_ACT_SHOT)?;
     Ok(unsafe { bpf_redirect(entry.ifindex, flags) } as c_long)
 }
 

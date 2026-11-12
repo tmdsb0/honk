@@ -9,6 +9,7 @@ use super::block::BlockHandler;
 use super::direct::DirectHandler;
 use super::hysteria2::Hysteria2Handler;
 use super::juicity::JuicityHandler;
+use super::masque::MasqueHandler;
 use super::shadowsocks::ShadowsocksHandler;
 use super::socks5::Socks5Handler;
 use super::trojan::TrojanHandler;
@@ -165,8 +166,11 @@ impl ProxyRegistry {
                     .with_probeable(vless),
             );
             let vmess = Arc::new(VmessHandler::new());
+            // Command-UDP is a connected association (one stream per target),
+            // so VMess has a packet handler but no shared multi-target source.
             registry.register(
                 ProtocolEntry::new(NodeProtocol::VMess, vmess.clone())
+                    .with_packet(vmess.clone())
                     .with_warmable(vmess.clone())
                     .with_probeable(vmess),
             );
@@ -185,6 +189,13 @@ impl ProxyRegistry {
                 .with_packet(tuic.clone())
                 .with_warmable(tuic.clone())
                 .with_probeable(tuic),
+        );
+        let masque = Arc::new(MasqueHandler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::Masque, masque.clone())
+                .with_packet(masque.clone())
+                .with_warmable(masque.clone())
+                .with_probeable(masque),
         );
         let juicity = Arc::new(JuicityHandler::new());
         registry.register(
@@ -250,6 +261,29 @@ impl ProxyRegistry {
             let tcp = Arc::clone(&entry.tcp);
             Ok(async move {
                 tcp.dial_runtime(runtime, target, target_domain, connect_timeout)
+                    .await
+            })
+        })
+        .await
+    }
+
+    /// Dial a node through a detour the caller names, rather than the node's
+    /// own — the one a group carries, resolved to this path only once a flow
+    /// arrives.
+    pub async fn dial_runtime_detoured(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: Arc<crate::proxy::detour::DetourPath>,
+    ) -> anyhow::Result<ProxyStream> {
+        self.dial_generation(generation, node_id, |runtime, entry| {
+            let tcp = Arc::clone(&entry.tcp);
+            let detour = Arc::clone(&detour);
+            Ok(async move {
+                tcp.dial_runtime_detoured(runtime, target, target_domain, connect_timeout, &detour)
                     .await
             })
         })
@@ -431,6 +465,35 @@ impl ProxyRegistry {
             Ok(async move {
                 packet
                     .dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
+                    .await
+            })
+        })
+        .await
+    }
+
+    /// Generation-pinned framed UDP transport over a detour a group names.
+    /// A detoured flow never borrows a pooled or shared-source carrier, whose
+    /// own path would otherwise decide where the packets leave.
+    pub async fn dial_udp_transport_runtime_detoured(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        node_id: uuid::Uuid,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        detour: Arc<crate::proxy::detour::DetourPath>,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_generation(generation, node_id, |runtime, entry| {
+            let packet = Arc::clone(Self::packet_for_runtime(&runtime, entry, target.port())?);
+            Ok(async move {
+                packet
+                    .dial_udp_transport_runtime_detoured(
+                        runtime,
+                        target,
+                        target_domain,
+                        connect_timeout,
+                        &detour,
+                    )
                     .await
             })
         })
