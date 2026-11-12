@@ -922,9 +922,9 @@ Subscription rows carry `download`, derived from `download_detour` and shaped li
 
 File and inline rows report null for `download`.
 
-A failed fetch reports `last_error.code` `fetch_failed`, or `route_unavailable` when the subscription's download route has no usable node yet. See the [subscription reference](./subscription.md#fetch-persistence-and-recovery). For classified `fetch_failed` errors, `details` gives the failing `stage` (such as `connection_failed`, `download_timeout`, `tls_failed` or `parse_failed`), the selected `node`, and its selecting group's `group_id`. Unclassified failures, such as invalid URLs or redirects, have `details: null`. `node` is null for direct downloads, failures before node selection, and parse failures whose download attribution is unavailable. `group_id` is null when attribution has no group or that group no longer exists in the catalog. A publication that configuration validation rejects, such as a node that duplicates a static node, reports `publication_rejected` with the diagnostic in `details.diagnostic_code` (for example `duplicate-node-id`).
+A failed fetch reports `last_error.code` `fetch_failed`, or `route_unavailable` when the subscription's download route has no usable node yet. See the [subscription reference](./subscription.md#fetch-persistence-and-recovery). A publication that configuration validation rejects, such as a node that duplicates a static node, reports `publication_rejected` with the diagnostic in `details.diagnostic_code` (for example `duplicate-node-id`).
 
-A refresh operation that fails on a rejected publication carries the same `details.diagnostic_code`; the fetch `stage`, `node` and `group_id` appear only in the provider's `last_error`.
+A failed refresh operation carries the same details.
 
 `POST /providers/{id}/refresh` takes an empty body and optional `Idempotency-Key`, returning a 202 operation. Success requires actual revision-authorized runtime publication, not just fetch or cache write. Disconnecting HTTP does not cancel admitted work.
 
@@ -1136,8 +1136,8 @@ Both directories must contain `index.html`. `HONK_DOONA_DIR` is the only require
 
 | Pin in `.github/ci/pins.env` | Value |
 | --- | --- |
-| doona release | `0.1.0-rc.5` |
-| Commit | `6102778700c6cd15908cf2a76be7121d0355da21` |
+| doona release | `0.1.0-rc.4` |
+| Commit | `58dfe2e2d1bccb1c0363895adb27eb4bfa1e932d` |
 | Archive checksums | `DOONA_SHA256`, `DOONA_LITE_SHA256` |
 
 From the repository root, run `export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`. The script:
@@ -1154,9 +1154,9 @@ Full release builds include the embedded UI. The lean `-clash-api` and `-native-
 
 Lite uses system fonts. The Noto Sans TC and SC fonts are not embedded. Doona's CSS declares those fonts with `font-display: optional`, so the browser falls back to system fonts when the font requests return 404.
 
-To use Noto Sans, extract `doona-<version>.tar.gz` and `doona-fonts-<version>.tar.gz` from the [doona release](https://github.com/Zakkaus/doona/releases) into one directory and point `ui` at it, or install the `doona` and `doona-fonts` packages and set `ui: /usr/share/doona`. Both editions share the corresponding GPL-3.0-only source at the doona tag [`v0.1.0-rc.5`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.5).
+To use Noto Sans, extract `doona-<version>.tar.gz` and `doona-fonts-<version>.tar.gz` from the [doona release](https://github.com/Zakkaus/doona/releases) into one directory and point `ui` at it, or install the `doona` and `doona-fonts` packages and set `ui: /usr/share/doona`. Both editions share the corresponding GPL-3.0-only source at the doona tag [`v0.1.0-rc.4`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.4).
 
-The release workflow attaches `doona-source-0.1.0-rc.5.tar.gz` to the tag release and to the rolling Debug release. `ci/fetch-doona.sh --source` checks that the tag still points at the pinned commit and generates it with `git archive --format=tar --prefix=doona/ v0.1.0-rc.5 | gzip -n` (GNU gzip). Redistributors of a `native-ui` binary must preserve the notices and provide corresponding source through a method permitted by GPL-3.0 section 6.
+The release workflow attaches `doona-source-0.1.0-rc.4.tar.gz` to the tag release and to the rolling Debug release. `ci/fetch-doona.sh --source` checks that the tag still points at the pinned commit and generates it with `git archive --format=tar --prefix=doona/ v0.1.0-rc.4 | gzip -n` (GNU gzip). Redistributors of a `native-ui` binary must preserve the notices and provide corresponding source through a method permitted by GPL-3.0 section 6.
 
 To reproduce the assets, extract the source archive into its own directory, use Node matching `^22.13.0 || ^24.0.0 || >=26.0.0` and `pnpm@11.15.1`. From the extracted source directory:
 

@@ -824,9 +824,9 @@ action 为 `upstream` 或 `requery` 时，`upstream` 为引擎使用的小写名
 
 真实失败且无节点才是 error，保留旧/缓存节点时为 stale。订阅条目还带有 `download`，即由 `download_detour` 决定的拉取路由，结构与 geodata 路由相同：`route` 为 `routing`、`direct` 或 `group`，`group_id` 为该组在 `GET /groups` 中的 ID，其他路由或组已不存在时为 null。文件与内联条目为 null。
 
-拉取失败时 `last_error.code` 为 `fetch_failed`。订阅的下载路由尚无可用节点时为 `route_unavailable`，见[订阅参考](./subscription.md#拉取持久化与恢复)。已分类的 `fetch_failed` 错误通过 `details` 给出失败阶段 `stage`（例如 `connection_failed`、`download_timeout`、`tls_failed`、`parse_failed`）、选中的节点 `node` 和选中该节点的组 `group_id`。无效 URL、重定向等未分类失败返回 `details: null`。直连下载、选中节点前的失败，以及无法保留下载归属的解析失败，其 `node` 为 null；没有组归属或对应组已不在目录中时，`group_id` 为 null。配置校验拒绝发布时（例如节点与静态节点重复），`last_error.code` 为 `publication_rejected`，诊断代码写在 `details.diagnostic_code`（例如 `duplicate-node-id`）。
+拉取失败时 `last_error.code` 为 `fetch_failed`。订阅的下载路由尚无可用节点时为 `route_unavailable`，见[订阅参考](./subscription.md#拉取持久化与恢复)。配置校验拒绝发布时（例如节点与静态节点重复），`last_error.code` 为 `publication_rejected`，诊断代码写在 `details.diagnostic_code`（例如 `duplicate-node-id`）。
 
-因发布被拒而失败的 refresh 操作带相同的 `details.diagnostic_code`；拉取的 `stage`、`node` 和 `group_id` 只出现在订阅源的 `last_error` 中。列表 `limit` 默认 100、范围 1–1000，快照上限 8 份/30 秒/4 MiB，容量不足时返回 `503 snapshot_unavailable` 并带 `Retry-After`。游标无法识别时同样返回 `410 snapshot_expired`，带不同过滤器或 `limit` 的已识别游标返回 `400 invalid_request`。
+失败的 refresh 操作带相同的 details。列表 `limit` 默认 100、范围 1–1000，快照上限 8 份/30 秒/4 MiB，容量不足时返回 `503 snapshot_unavailable` 并带 `Retry-After`。游标无法识别时同样返回 `410 snapshot_expired`，带不同过滤器或 `limit` 的已识别游标返回 `400 invalid_request`。
 
 启用且有运行 supervisor 的订阅可 POST refresh。订阅已禁用或未挂接 supervisor（`can_refresh: false`）时返回 `404 capability_not_supported`。同订阅源的不同并发 refresh 为 409，保留的幂等重放先于冲突检查。
 
@@ -1059,8 +1059,8 @@ ID 不对应当前任何组时返回 `409 state_conflict`。已存储的组被�
 
 | `.github/ci/pins.env` 中的固定项 | 值 |
 | --- | --- |
-| doona 版本 | `0.1.0-rc.5` |
-| 提交 | `6102778700c6cd15908cf2a76be7121d0355da21` |
+| doona 版本 | `0.1.0-rc.4` |
+| 提交 | `58dfe2e2d1bccb1c0363895adb27eb4bfa1e932d` |
 | 压缩包校验和 | `DOONA_SHA256`、`DOONA_LITE_SHA256` |
 
 在仓库根目录执行 `export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`。脚本依次执行：
@@ -1082,7 +1082,7 @@ ID 不对应当前任何组时返回 `409 state_conflict`。已存储的组被�
 - 从 [doona 发布页](https://github.com/Zakkaus/doona/releases)下载 `doona-<version>.tar.gz` 与 `doona-fonts-<version>.tar.gz`，解压到同一目录，并让 `ui` 指向该目录。
 - 安装 `doona` 与 `doona-fonts` 软件包，并设置 `ui: /usr/share/doona`。
 
-两种版本共用的 GPL-3.0-only 源码是 doona 标签 [`v0.1.0-rc.5`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.5)。发布流程将 `doona-source-0.1.0-rc.5.tar.gz` 附加到正式标签发布与滚动 Debug 发布。该包由 `ci/fetch-doona.sh --source` 生成：先确认标签仍指向固定提交，再执行 `git archive --format=tar --prefix=doona/ v0.1.0-rc.5 | gzip -n`（GNU gzip）。
+两种版本共用的 GPL-3.0-only 源码是 doona 标签 [`v0.1.0-rc.4`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.4)。发布流程将 `doona-source-0.1.0-rc.4.tar.gz` 附加到正式标签发布与滚动 Debug 发布。该包由 `ci/fetch-doona.sh --source` 生成：先确认标签仍指向固定提交，再执行 `git archive --format=tar --prefix=doona/ v0.1.0-rc.4 | gzip -n`（GNU gzip）。
 
 再分发 `native-ui` 二进制时，须保留声明，并按 GPL-3.0 第 6 条允许的方式提供对应源码。
 

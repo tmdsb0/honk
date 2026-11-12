@@ -37,7 +37,8 @@ group {
 | `filter: subtag(...)` | `filters` + `nodes` | `[]` | 按产生节点的订阅的当前 tag 选择节点。 |
 | `filter: group(...)` | `groups` | `[]` | 加入嵌套组 tag。接受逗号分隔的参数和竖线分隔的 tag。 |
 | `default` | `default` | `null` | `selector` 的初始或回退成员 tag。 |
-| `final` | `final_outbound` | `null` | 组策略没有合格选择时使用的节点、组、`direct` 或 `block`，该组嵌套在其他组中时同样生效。Final 节点仍受健康检查约束；缺失或成环的 final 会拒绝，不会隐式直连。 |
+| `final` | `final_outbound` | `null` |
+| `detour` | `detour` | `null` | 本组成员拨号时经过的前置节点、组，或 `direct`（显式直连）。每次拨号时解析；组自身未写时沿 `filter: group(X)` 引用边继承上游组的 detour，显式值优先并停止查找。详见[配置指南](../guide/chained-proxy-and-masque.md)。 | 组策略没有合格选择时使用的节点、组、`direct` 或 `block`，该组嵌套在其他组中时同样生效。Final 节点仍受健康检查约束；缺失或成环的 final 会拒绝，不会隐式直连。 |
 | `check_url` | `check_url` | `null` | 非 Selector 策略的按组 TCP 健康检查目标。Selector 会忽略该字段并告警。 |
 | —（dae 中不可配置） | `check_interval` | `null` | 按组间隔字段，单位为秒。当前运行时不读取该字段，而使用全局间隔。 |
 | `tolerance` | `tolerance` | `50` | 非负整数毫秒；dae URLTest 组未显式设置时继承 `global.check_tolerance`，显式值优先；运行时有效下限为 1 ms。 |
@@ -51,7 +52,7 @@ group {
 | ------ | --------------- | ---- |
 | `selector` | `selector`、`select`、`fixed`、`fixed(0)` | TCP/UDP 各自维护运行时选择，在健康过滤前依次使用对应网络的选择、`default` 和第一个现存成员。健康状态不会把有效选择替换成兄弟成员；选择可为直接节点或嵌套组 tag。 |
 | `urltest` | `urltest`、`min_moving_avg`、`min_avg10`、`min_last_delay` | 使用减半移动平均 `(prev + sample) / 2` 和 tolerance 选择延迟最低的存活成员；TCP 与 UDP 选择相互独立。 |
-| `loadbalance` | `loadbalance`、`roundrobin`、`round_robin`、`balance` | 对存活成员轮询；每个组以及 TCP/UDP 网络各有独立计数器。连向同一目标的相邻连接会从不同节点出去，TCP 与 UDP 也各自轮换，因此把会话绑定到客户端地址的服务会断开：登录状态失效，Cloudflare 的放行记录会被重新质询。需要稳定出口时改用 `urltest` 或 `score`。 |
+| `loadbalance` | `loadbalance`、`roundrobin`、`round_robin`、`balance` | 对存活成员轮询；每个组以及 TCP/UDP 网络各有独立计数器。 |
 | `fallback` | `fallback` | 分别为 TCP 和 UDP 按声明顺序固定第一个存活成员；更靠前的成员恢复后不会立即切回。 |
 | `score` | `score` | 根据实际可靠性、新鲜目标质量与有界验证选择一个存活成员；TCP/UDP 和目标 IPv4/IPv6 证据各自隔离。 |
 
@@ -61,7 +62,7 @@ group {
 
 已选子组会先解析自己的显式 `final`，再向父组返回空结果。这不允许改选其他 Selector 兄弟成员，也不允许重试终态协议拒绝。IPv6 目标仍优先尝试经 IPv4 代理健康状态可达的普通已选叶节点，然后才执行 final 路径。
 
-UDP 资格同时要求协议／配置支持和健康条件；VMess 与显式仅支持 TCP 的叶节点在选择及 Score 比较前被排除，TCP 选择不受影响。Selector 已选节点不具备 UDP 能力并不允许改选兄弟成员，内置 `block` 仍保持终态。能力过滤不能绕过已选节点针对具体目标的 UDP 策略拒绝。
+UDP 资格同时要求协议／配置支持和健康条件；显式仅支持 TCP 的叶节点（例如 `network: tcp` 的 VMess 或 VLESS）在选择及 Score 比较前被排除，TCP 选择不受影响。Selector 已选节点不具备 UDP 能力并不允许改选兄弟成员，内置 `block` 仍保持终态。能力过滤不能绕过已选节点针对具体目标的 UDP 策略拒绝。
 
 不同节点使用同一显示 tag 时，按名称指定的默认选择和 Clash 写入在健康过滤前按组内声明顺序绑定第一个匹配成员的 `NodeId`；原生成员 ID 可选择特定的直接成员。健康状态不会把任一选择改选为另一个同名且健康的节点。
 按名称指定的 `final` 节点同样绑定配置中第一个匹配声明，不会用健康的同名节点替换；选择与 final 节点健康注册使用同一身份。
@@ -135,8 +136,17 @@ honk 会忽略无法解析的过滤器，并在诊断中注明其在组内节点
 
 面向 Clash 的组输出保留成员 tag：`all` 字段列出直接节点名和嵌套组 tag，而不展开嵌套组。面向叶节点的健康状态与连通性遍历会展开这些 tag 下的实际节点。
 
+## 组级 detour 与继承
+
+`detour:` 指定本组所选成员拨号时经过的前置，可写节点名、组名或 `direct`。它与节点自身的 `dialer-proxy` 是两层独立机制；经过本组的流量按本组的 detour 拨号，建议不要混用。
+
+`filter: group(X)` 是引用边而非拷贝节点列表，因此本组没写 `detour:` 时会继承 X 的 detour：按声明顺序对引用边做广度优先查找，取第一个命中的值，并用 `visited` 防环。显式 `detour:`（含 `direct`）优先并停止查找。`final:` 只是策略无合格选择时的回退，不参与继承；用 `name()` / `subtag()` 直接过滤出成员、没有引用边的组也不会继承。
+
+组 detour 的解析集中在 `group_detour()`，TCP 拨号、UDP 拨号以及 Clash / 原生 API 的延迟测试都读同一个结果，所以延迟测试测到的是真实业务链路。前置写成组时，Selector 切换或 Fallback 故障转移会在后续拨号立即生效，不需要重启。协议支持范围与验证方法见[链式代理与 MASQUE 配置指南](../guide/chained-proxy-and-masque.md)。
+
 ## 相关文档
 
 - [节点参考](./nodes.md)
+- [链式代理与 MASQUE 配置指南](../guide/chained-proxy-and-masque.md)
 - [路由参考](./routing.md)
 - [组设计](../design/groups.md)

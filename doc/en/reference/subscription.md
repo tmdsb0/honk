@@ -69,7 +69,7 @@ Quote-error and block rules are listed in the [dialect reference](./dialect.md).
 | Field | Type | Default | Settable in dae | Meaning |
 | --- | --- | --- | --- | --- |
 | `id` | UUID | random UUID | No | Runtime subscription identity; SIGHUP preserves it when the fetch identity (URL + configured `ua` + headers) matches an existing subscription. |
-| `name` | string | `""` | Yes, as the tag; otherwise the URL host | Display tag and the value used by group `subtag(...)` filters and DNS `subtag(...)` rules. |
+| `name` | string | `""` | Yes, as the tag; otherwise the URL host | Display tag and the value used by group `subtag(...)` filters. |
 | `url` | string | `""` | Yes | HTTP(S) fetch URL. |
 | `sub_type` | enum | `simple` | No | Body parser: `simple`, `clash`, `sip008`, or `custom`. |
 | `update_interval` | u64 | `86400` | Yes, as `interval` | Periodic refresh interval in seconds; `0` disables periodic refresh. |
@@ -160,7 +160,7 @@ Failure handling preserves a usable runtime rather than clearing it:
 - HTTP, invalid UTF-8 encoding, parse, or no-usable-node failure publishes no replacement nodes and performs no write, so the active nodes and last valid stored body remain. Accepted bodies are persisted byte-for-byte, without repairing encoding.
 - Fetch failures first retry after the smaller of 30 seconds and `interval`, then double the delay up to the smaller of 10 minutes and `interval`; `interval: 0` disables automatic retries. Publication acceptance or rejection clears existing backoff and resumes the normal interval.
 - A persistence-write failure is non-fatal after parsing: the newly parsed nodes are still returned for publication, while the atomic path never installs a partially written body. The next restart can therefore restore whichever complete valid body remains on disk.
-- An unsupported or malformed node is skipped individually. The shared node builder's warning includes a one-based entry index and a static rejection reason. Stream-normalization failures also retain the canonical field, such as `proxies[1].xhttp` or `outbounds[1].ws_headers`, without exposing supplied header names, values or credentials. The whole body fails only when no usable nodes remain; an empty result never clears the previous generation.
+- An unsupported or malformed node is skipped individually. The shared node builder's warning includes a one-based proxy index and a static rejection reason, never the raw record or its credentials. The whole body fails only when no usable nodes remain; an empty result never clears the previous generation.
 
 The last valid body is the last body accepted by the current import policy, not the last successfully published runtime generation. A partial body with one distinct usable node may replace the stored body; an all-invalid body cannot. Restore reparses with the current policy and may reject a body saved by an older version. Runtime collection or publication failure after a successful write retains the active generation but can leave the new body on disk. Disk and active state are not one transaction.
 
@@ -243,7 +243,7 @@ Supported spelling aliases normalize before node identity is derived.
 | TUIC | UUID/password, congestion control, ALPN, receive windows, MTU. |
 | AnyTLS | `idle-session-check-interval`, `idle-session-timeout`, `min-idle-session`. |
 
-Explicit disabled feature blocks are treated as disabled, not as unsupported active features. `udp: true` is accepted for intrinsically UDP-capable protocols, and ignored on VMess, which has no UDP path, so the node still imports for TCP. An explicit UDP restriction is rejected where the node model cannot preserve it.
+Explicit disabled feature blocks are treated as disabled, not as unsupported active features. `udp: true` is accepted for intrinsically UDP-capable protocols, including VMess, which carries UDP with command-UDP. An explicit UDP restriction is rejected where the node model cannot preserve it.
 
 TUIC permits an absent or empty password. Hysteria2 and Juicity accept an explicit `h3` ALPN matching their fixed runtime selection.
 
@@ -291,8 +291,7 @@ VLESS fields are applied before node identity is derived:
 | `reality-opts.short-id` | Optional REALITY short ID. |
 | `reality-opts.spider-x` | REALITY spider path; missing or empty becomes `/`. |
 | `ws-opts.path` | WebSocket path; falls back to flat `ws-path`. |
-| `ws-opts.headers.Host` | WebSocket Host header: the first nonblank case-insensitive Host value wins; strings retain their bytes and finite numbers become text. Invalid or blank Host values are ignored. Falls back to scalar `ws-headers`, then `ws-host`, inspecting each only if no earlier value won. |
-| `ws-opts.headers.<name>` | Additional WebSocket upgrade headers, shared by every WebSocket-capable proxy, imported as lowercase names (for example `User-Agent`). Null values are ignored and non-scalar values drop the entry; reserved handshake headers reject it per the [node field contract](./nodes.md#node-fields). |
+| `ws-opts.headers.Host` | WebSocket Host header, with case-insensitive key matching; falls back to scalar `ws-headers`, then `ws-host`. |
 | `grpc-opts.grpc-service-name` | gRPC service name; falls back to `grpc-service`. |
 | `client-fingerprint` | Intentionally not imported. TLS fingerprint selection is process-wide through `global.tls_implementation` and `global.utls_imitate`. |
 
@@ -338,11 +337,10 @@ sing-box profiles import supported entries from `outbounds`:
 - Proxy nodes: Shadowsocks, SOCKS5, VMess, VLESS, Trojan, Hysteria2, TUIC, Juicity, and AnyTLS.
 - Structural entries, not proxy nodes: `selector`, `urltest`, `direct`, `block`, and `dns`.
 
-TLS/SNI, REALITY, WebSocket/gRPC (including non-`Host` upgrade headers), VLESS packet choices, and supported protocol tuning normalize through the common node builder.
+TLS/SNI, REALITY, WebSocket/gRPC, VLESS packet choices, and supported protocol tuning normalize through the common node builder.
 
 | Source-specific case | Import behavior |
 | --- | --- |
-| WebSocket `transport.headers` | `Host` remains a dedicated string field; repeated Host aliases reject. Other string values, including empty strings, are preserved; null is ignored and other types reject the entry. Names and values follow the [node header contract](./nodes.md#node-fields). |
 | VLESS without an enabled H2MUX/UoT wrapper or explicit `packet_encoding` selecting another path | Single XUDP with UDP permitted. This is a sing-box import default, not the global meaning of Auto. |
 | Empty or omitted gRPC service name | Retain sing-box's empty service, not honk's `GunService` default. |
 | Hysteria2 `server_ports` without `server_port` | Use the first hopping port as the nominal endpoint. |

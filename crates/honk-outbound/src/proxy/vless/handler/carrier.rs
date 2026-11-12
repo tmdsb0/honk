@@ -12,6 +12,9 @@ impl VLessHandler {
     /// concrete `EncryptedStream` through response and Vision wrapping so
     /// Direct bypasses only AEAD while its boxed outer transport stays intact.
     /// Unencrypted raw TCP/TLS keeps its concrete type for the existing raw switch.
+    // The detour is the eighth argument; every one of them is a distinct
+    // input to the dial, and grouping them would only move the count.
+    #[allow(clippy::too_many_arguments)]
     async fn dial_carrier(
         &self,
         node: &Node,
@@ -19,6 +22,7 @@ impl VLessHandler {
         header: Vec<u8>,
         tcp: Option<TcpStream>,
         connect_timeout: std::time::Duration,
+        detour: Option<&crate::proxy::detour::DetourPath>,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
         let vless = node.vless().unwrap();
@@ -26,7 +30,7 @@ impl VLessHandler {
         let encryption = self.encryption_config(node)?;
         if node.is_xhttp() {
             let stream =
-                crate::proxy::transport::wrap_transport(node, tcp, connect_timeout).await?;
+                crate::proxy::transport::wrap_transport(node, tcp, connect_timeout, detour).await?;
             return start_boxed(encryption, stream, &header, vision).await;
         }
         if encryption.is_none()
@@ -34,8 +38,13 @@ impl VLessHandler {
             && matches!(vless.transport.transport.as_str(), "" | "tcp")
         {
             let stream: Box<dyn AsyncReadWrite> =
-                match crate::proxy::transport::maybe_tls_wrap_concrete(node, tcp, connect_timeout)
-                    .await?
+                match crate::proxy::transport::maybe_tls_wrap_concrete(
+                    node,
+                    tcp,
+                    connect_timeout,
+                    detour,
+                )
+                .await?
                 {
                     crate::proxy::transport::MaybeTls::Tls(tls) => {
                         if tls.ssl().version2() != Some(boring::ssl::SslVersion::TLS1_3) {
@@ -56,7 +65,8 @@ impl VLessHandler {
             });
         }
 
-        let stream = crate::proxy::transport::maybe_tls_wrap(node, tcp, connect_timeout).await?;
+        let stream =
+            crate::proxy::transport::maybe_tls_wrap(node, tcp, connect_timeout, detour).await?;
         let stream: Box<dyn AsyncReadWrite> = match permit {
             Some(permit) => Box::new(crate::proxy::RuntimeOwnedIo {
                 inner: stream,
@@ -85,7 +95,46 @@ impl VLessHandler {
             target_domain,
             vless.wire_flow(),
         )?;
-        let operation = self.dial_carrier(node, uuid, header, tcp, connect_timeout, None);
+        let operation = self.dial_carrier(node, uuid, header, tcp, connect_timeout, None, None);
+        let stream =
+            crate::runtime::flow_observation::request_write(std::pin::pin!(operation)).await?;
+        Ok(ProxyStream {
+            stream,
+            target_addr: target,
+            target_domain: target_domain.map(str::to_string),
+        })
+    }
+
+    /// [`dial_base`] over a detour the caller names, not the node's own.
+    ///
+    /// The carrier is what a detour replaces, and VLESS has always been able
+    /// to dial one over a supplied path; only the outermost entry was missing.
+    pub(super) async fn dial_base_detoured(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        detour: &crate::proxy::detour::DetourPath,
+    ) -> anyhow::Result<ProxyStream> {
+        let vless = node.vless().unwrap();
+        let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
+        let header = Self::build_request_header(
+            &uuid,
+            CMD_TCP,
+            Some(target),
+            target_domain,
+            vless.wire_flow(),
+        )?;
+        let operation = self.dial_carrier(
+            node,
+            uuid,
+            header,
+            None,
+            connect_timeout,
+            Some(detour),
+            None,
+        );
         let stream =
             crate::runtime::flow_observation::request_write(std::pin::pin!(operation)).await?;
         Ok(ProxyStream {
@@ -105,6 +154,28 @@ impl VLessHandler {
         Box<dyn AsyncReadWrite>,
         crate::proxy::transport::TransportPreparation,
     )> {
+        self.prepare_retained_carrier_detoured(runtime, uuid, header, timeout, None)
+            .await
+    }
+
+    /// The same carrier over a detour the caller names rather than the node's.
+    ///
+    /// `None` means "whatever the node's own detour is", which is what every
+    /// call that is not answering a group's detour has always meant; passing
+    /// it through one function keeps the two paths from drifting apart.
+    pub(super) async fn prepare_retained_carrier_detoured(
+        &self,
+        runtime: &Arc<crate::runtime::NodeRuntime>,
+        uuid: [u8; 16],
+        header: Vec<u8>,
+        timeout: std::time::Duration,
+        detour: Option<&crate::proxy::detour::DetourPath>,
+    ) -> anyhow::Result<(
+        Box<dyn AsyncReadWrite>,
+        crate::proxy::transport::TransportPreparation,
+    )> {
+        let bound = runtime.detour();
+        let detour = detour.or(bound.as_deref());
         if runtime.xhttp.is_none() {
             let permit = runtime.acquire_vless_carrier()?;
             let stream = runtime
@@ -114,6 +185,7 @@ impl VLessHandler {
                     header,
                     None,
                     timeout,
+                    detour,
                     Some(permit),
                 )))
                 .await?;
@@ -124,9 +196,10 @@ impl VLessHandler {
         }
         runtime
             .scope_tasks(runtime.transport_quality().scope(async {
-                let (stream, preparation) =
-                    crate::proxy::transport::prepare_transport_runtime(runtime, None, timeout)
-                        .await?;
+                let (stream, preparation) = crate::proxy::transport::prepare_transport_runtime(
+                    runtime, None, timeout, detour,
+                )
+                .await?;
                 let vision = runtime.node.vless().unwrap().is_vision().then_some(uuid);
                 let encryption = self.encryption_config(&runtime.node)?;
                 Ok((
@@ -144,6 +217,20 @@ impl VLessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<(ProxyStream, crate::proxy::transport::TransportPreparation)> {
+        self.prepare_retained_base_detoured(runtime, target, target_domain, connect_timeout, None)
+            .await
+    }
+
+    /// [`prepare_retained_base`] over a detour the caller names, which is how
+    /// a group's detour reaches a VLESS member. `None` keeps the node's own.
+    pub(super) async fn prepare_retained_base_detoured(
+        &self,
+        runtime: &Arc<crate::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+        detour: Option<&crate::proxy::detour::DetourPath>,
+    ) -> anyhow::Result<(ProxyStream, crate::proxy::transport::TransportPreparation)> {
         let vless = runtime.node.vless().unwrap();
         let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
         let header = Self::build_request_header(
@@ -154,7 +241,7 @@ impl VLessHandler {
             vless.wire_flow(),
         )?;
         let (stream, preparation) = self
-            .prepare_retained_carrier(runtime, uuid, header, connect_timeout)
+            .prepare_retained_carrier_detoured(runtime, uuid, header, connect_timeout, detour)
             .await?;
         Ok((
             ProxyStream {

@@ -285,7 +285,7 @@ async fn udp_carrier_close_is_node_failure() {
         let server_addr = start_server(datagrams, TEST_PASSWORD).await;
         let node = test_node(server_addr.port(), TEST_PASSWORD);
         let handler = TuicHandler::new();
-        let client = handler.build_client(&node, None).await.unwrap();
+        let client = handler.build_client(&node, None, None).await.unwrap();
         let timeout = Duration::from_secs(5);
         let transport = handler
             .udp_transport_via_client(
@@ -316,7 +316,7 @@ async fn assert_udp_session_id_rotation(datagrams: bool) {
     let server_addr = start_server(datagrams, TEST_PASSWORD).await;
     let node = test_node(server_addr.port(), TEST_PASSWORD);
     let handler = TuicHandler::new();
-    let client = handler.build_client(&node, None).await.unwrap();
+    let client = handler.build_client(&node, None, None).await.unwrap();
     let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
     let timeout = Duration::from_secs(5);
 
@@ -480,3 +480,21 @@ fn test_fragmentation_small_packet_not_fragmented() {
 }
 
 mod source_udp;
+
+/// QUIC rides a detour the same way TCP does, so the binding rule holds here
+/// too: a named detour with no path bound must fail the dial rather than fall
+/// back to a socket of this node's own.
+#[tokio::test]
+async fn a_named_detour_must_be_bound_for_quic_too() {
+    let mut node = test_node(1, TEST_PASSWORD);
+    node.detour = Some("front".into());
+    let error = TuicHandler::new()
+        .build_client(&node, None, None)
+        .await
+        // `Result::expect_err` would demand `Debug` on the client, which is
+        // never worth deriving for a live socket holder.
+        .err()
+        .expect("an unbound detour must not dial")
+        .to_string();
+    assert!(error.contains("is not bound in this generation"), "{error}");
+}

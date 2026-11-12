@@ -341,11 +341,48 @@ async fn dns_fork_owns_sessions_but_preserves_dial_limits() {
 }
 
 #[test]
+fn dns_fork_carries_the_detour_bindings() {
+    use crate::proxy::ProxyRegistry;
+    use crate::proxy::detour::DetourPath;
+
+    let front = canonical_node("fork-front");
+    let mut back = canonical_node("fork-back");
+    // The identity covers the detour, so re-derive the id after setting it.
+    back.detour = Some("fork-front".into());
+    back.id = back.derive_id();
+    let generation =
+        Arc::new(OutboundRuntimeRegistry::build(&[front.clone(), back.clone()]).unwrap());
+    let path = DetourPath::new(
+        Arc::new(ProxyRegistry::new()),
+        Arc::clone(&generation),
+        front.id,
+    );
+    assert!(generation.bind_detour(back.id, Arc::new(path)));
+    assert!(generation.get(&back.id).unwrap().detour().is_some());
+
+    // The fork rebuilds every runtime fresh; without the carry-over the
+    // forked runtime holds no detour and every DNS dial for `back` would
+    // be refused with "detour ... is not bound in this generation".
+    let dns = generation.fork_for_dns().unwrap();
+    assert!(dns.get(&back.id).unwrap().detour().is_some());
+    assert!(dns.get(&front.id).unwrap().detour().is_none());
+}
+
+#[test]
 fn udp_capability_matrix() {
     let anytls = node("x", NodeProtocol::AnyTLS);
     assert!((crate::descriptor::descriptor(anytls.protocol()).supports_udp)(&anytls));
-    let vmess = node("x", NodeProtocol::VMess);
-    assert!(!(crate::descriptor::descriptor(vmess.protocol()).supports_udp)(&vmess));
+    let mut vmess = node("x", NodeProtocol::VMess);
+    let vmess_udp = crate::descriptor::descriptor(vmess.protocol()).supports_udp;
+    assert!(
+        vmess_udp(&vmess),
+        "VMess command-UDP is available by default"
+    );
+    vmess.vmess_mut().unwrap().network = Some("tcp".into());
+    assert!(
+        !vmess_udp(&vmess),
+        "an explicit tcp-only network still gates UDP"
+    );
     let hy2 = node("x", NodeProtocol::Hysteria2);
     assert!((crate::descriptor::descriptor(hy2.protocol()).supports_udp)(&hy2));
 }
@@ -790,5 +827,41 @@ mod fallible_factory_tests {
             "invalid-config-value",
             0,
         );
+    }
+
+    /// A reload reuses the runtime of a node whose own config did not change,
+    /// but the detour belongs to the generation. A one-shot binding silently
+    /// kept the previous front, so switching the front had no effect until a
+    /// full restart.
+    #[test]
+    fn a_reused_runtime_accepts_a_replacement_detour_binding() {
+        let node = canonical_node("chained-endpoint");
+        let registry =
+            Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap());
+        let runtime = registry.get(&node.id).unwrap();
+        let proxies = Arc::new(crate::proxy::ProxyRegistry::new());
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+
+        runtime.bind_detour(Arc::new(crate::proxy::detour::DetourPath::new(
+            Arc::clone(&proxies),
+            Arc::clone(&registry),
+            first,
+        )));
+        assert!(format!("{:?}", runtime.detour()).contains(&first.to_string()));
+
+        runtime.bind_detour(Arc::new(crate::proxy::detour::DetourPath::new(
+            Arc::clone(&proxies),
+            Arc::clone(&registry),
+            second,
+        )));
+        let bound = runtime.detour().expect("the detour stays bound");
+        let debug = format!("{bound:?}");
+        assert!(debug.contains(&second.to_string()), "{debug}");
+        assert!(!debug.contains(&first.to_string()), "{debug}");
+
+        // A generation that drops the detour must not inherit the old front.
+        runtime.clear_detour();
+        assert!(runtime.detour().is_none());
     }
 }

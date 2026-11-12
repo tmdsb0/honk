@@ -69,7 +69,7 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 | 字段 | 类型 | 默认值 | 可在 dae 中设置 | 含义 |
 | --- | --- | --- | --- | --- |
 | `id` | UUID | 随机 UUID | 否 | 运行时订阅身份；SIGHUP 时，若拉取身份（URL + 配置的 `ua` + 标头）与已有订阅匹配则保留该值。 |
-| `name` | string | `""` | 是，作为标签；省略时取 URL 主机名 | 显示标签，也是组 `subtag(...)` 过滤条件和 DNS `subtag(...)` 规则使用的值。 |
+| `name` | string | `""` | 是，作为标签；省略时取 URL 主机名 | 显示标签，也是组 `subtag(...)` 过滤条件使用的值。 |
 | `url` | string | `""` | 是 | HTTP(S) 拉取 URL。 |
 | `sub_type` | enum | `simple` | 否 | 正文解析器：`simple`、`clash`、`sip008` 或 `custom`。 |
 | `update_interval` | u64 | `86400` | 是，对应 `interval` | 定期刷新间隔，单位为秒；`0` 禁用定期刷新。 |
@@ -160,7 +160,7 @@ SIGHUP 时，拉取身份（URL + 配置的 `ua` + 标头）相同的订阅保�
 - HTTP、UTF-8 编码、解析或无可用节点错误不会发布替换节点，也不会写入，因此活动节点与上一次有效正文都会保留。通过校验的正文按原始字节保存，不修复编码。
 - 拉取失败后，首次等待 30 秒与 `interval` 中的较小值，再翻倍退避，最多为 10 分钟与 `interval` 中的较小值；`interval: 0` 禁用自动重试。发布成功或被拒绝都会结束已有退避，恢复正常刷新间隔。
 - 解析成功后，持久化写入失败属于非致命错误。新解析出的节点仍会返回用于发布，原子写入不会保存不完整的正文。下次重启可以恢复磁盘上保留的任一完整有效正文。
-- 不支持或格式错误的节点会逐个跳过。共用节点构建器的警告包含从 1 开始的条目索引和固定拒绝原因。流传输规范化错误还保留规范字段，例如 `proxies[1].xhttp` 或 `outbounds[1].ws_headers`，不暴露提交的标头名称、值或凭据。只有没有剩余可用节点时，整个正文才失败；空结果绝不会清空上一代节点。
+- 不支持或格式错误的节点会逐个跳过。共用节点构建器的警告包含从 1 开始的 proxy 索引和固定拒绝原因，不包含原始记录或凭据。只有没有剩余可用节点时，整个正文才失败；空结果绝不会清空上一代节点。
 
 上一次有效正文指通过当前导入规则校验的正文，不是最后一次成功发布的运行时配置。部分条目无效但仍有一个可用节点的正文可以替换存储；全部无效的正文不能。恢复时会按当前规则重新解析，因此旧版本保存的正文可能被拒绝。写入成功后，若节点集合校验或发布失败，活动配置保持不变，但磁盘上可能已保存新正文。磁盘与活动配置不属于同一事务。
 
@@ -243,7 +243,7 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 | TUIC | UUID/密码、拥塞控制、ALPN、接收窗口、MTU。 |
 | AnyTLS | `idle-session-check-interval`、`idle-session-timeout`、`min-idle-session`。 |
 
-显式关闭的功能块按禁用处理，不会误判为启用未支持功能。原生支持 UDP 的协议接受 `udp: true`；VMess 没有 UDP 路径，该声明会被忽略，节点仍按 TCP 导入。节点模型无法保留显式 UDP 限制时会拒绝导入。
+显式关闭的功能块按禁用处理，不会误判为启用未支持功能。原生支持 UDP 的协议接受 `udp: true`，包括使用 command-UDP 承载 UDP 的 VMess。节点模型无法保留显式 UDP 限制时会拒绝导入。
 
 TUIC 允许省略密码或使用空密码。Hysteria2 和 Juicity 接受与运行时固定选择一致的 `h3` ALPN。
 
@@ -291,8 +291,7 @@ VLESS 字段会在派生节点身份前应用：
 | `reality-opts.short-id` | 可选 REALITY short ID。 |
 | `reality-opts.spider-x` | REALITY spider path；缺失或为空时使用 `/`。 |
 | `ws-opts.path` | WebSocket path；回退到扁平别名 `ws-path`。 |
-| `ws-opts.headers.Host` | WebSocket Host 标头：键匹配不区分大小写，第一个非空白值优先；字符串保留原始字节，有限数字转为文本。无效或空白的 Host 值会被忽略。依次回退到 scalar `ws-headers`、`ws-host`，仅在之前没有可用值时才检查下一项。 |
-| `ws-opts.headers.<name>` | 附加 WebSocket 升级标头，所有支持 WebSocket 的代理共用；以小写名称导入（例如 `User-Agent`）。null 值忽略，非 scalar 值会使条目被丢弃；保留握手标头会按[节点字段约定](./nodes.md#节点字段)拒绝该条目。 |
+| `ws-opts.headers.Host` | WebSocket Host 标头，键匹配不区分大小写；依次回退到 scalar `ws-headers`、`ws-host`。 |
 | `grpc-opts.grpc-service-name` | gRPC service name；回退到 `grpc-service`。 |
 | `client-fingerprint` | 有意不导入。TLS 指纹由进程级 `global.tls_implementation` 与 `global.utls_imitate` 选择。 |
 
@@ -338,11 +337,10 @@ sing-box 配置从 `outbounds` 导入受支持的条目：
 - 代理节点：Shadowsocks、SOCKS5、VMess、VLESS、Trojan、Hysteria2、TUIC、Juicity、AnyTLS。
 - 结构性条目，不属于代理节点：`selector`、`urltest`、`direct`、`block`、`dns`。
 
-TLS/SNI、REALITY、WebSocket/gRPC（包括 `Host` 以外的升级标头）、VLESS 数据包选项和受支持的协议调优通过共用节点构建器规范化。
+TLS/SNI、REALITY、WebSocket/gRPC、VLESS 数据包选项和受支持的协议调优通过共用节点构建器规范化。
 
 | 来源特有情况 | 导入行为 |
 | --- | --- |
-| WebSocket `transport.headers` | `Host` 保留为独立 string 字段，重复 Host 别名拒绝。其他 string 值（包括空字符串）原样保留，null 忽略，其他类型使条目被拒绝；名称与值遵循[节点标头约定](./nodes.md#节点字段)。 |
 | VLESS 未启用 H2MUX/UoT 封装，且没有显式 `packet_encoding` 选择其他路径 | 使用 Single XUDP 并允许 UDP。这是 sing-box 导入默认值，不是 Auto 的全局含义。 |
 | gRPC 服务名为空或省略 | 保留 sing-box 的空服务名，不使用 honk 的 `GunService` 默认值。 |
 | Hysteria2 提供 `server_ports`，未提供 `server_port` | 以第一个跳跃端口作为名义端点。 |

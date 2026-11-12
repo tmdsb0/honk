@@ -18,7 +18,8 @@ mod tasks;
 pub use tasks::TaskOwner;
 pub use tasks::TaskScope;
 pub(crate) use tasks::{
-    RuntimeEndpoint, SharedTask, new_owned_quic_endpoint, spawn_joinable, spawn_owned,
+    RuntimeEndpoint, SharedTask, adopt_owned_quic_endpoint, new_owned_quic_endpoint,
+    spawn_joinable, spawn_owned,
 };
 #[cfg(any(feature = "rprx", test))]
 mod vless;
@@ -32,6 +33,7 @@ pub use admission::{DialPermit, DialScope};
 #[cfg(any(feature = "rprx", test))]
 pub use vless::VlessRuntime;
 
+pub use crate::proxy::masque::MasqueRuntime;
 use honk_config::node::Node;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -54,6 +56,8 @@ pub enum GenerationRuntime {
     AnyTls,
     Vless,
     Quic,
+    /// One MASQUE IP tunnel (TUN device + carrier) per node.
+    Masque,
 }
 
 impl GenerationRuntime {
@@ -76,6 +80,7 @@ impl GenerationRuntime {
                 ProtocolRuntime::None
             }
             Self::Quic => ProtocolRuntime::Quic(QuicRuntime::new(metrics_enabled, quality)),
+            Self::Masque => ProtocolRuntime::Masque(MasqueRuntime::new()),
         }
     }
 }
@@ -94,6 +99,8 @@ pub enum ProtocolRuntime {
     /// Type-erased TUIC, Juicity, or Hysteria2 client slot. Policy warm
     /// ownership may release the cached client before generation retirement.
     Quic(QuicRuntime),
+    /// One MASQUE IP tunnel for the node.
+    Masque(MasqueRuntime),
 }
 
 /// A protocol client stored in [`QuicRuntime`]. Implemented by the
@@ -361,6 +368,15 @@ pub struct NodeRuntime {
     /// Serializes warm establishment and release while tracking independent
     /// selector/UDP owners across runtime reuse on reload.
     warm_retention: Arc<tokio::sync::Mutex<u8>>,
+    /// The node this one dials through, resolved once the generation knows the
+    /// whole node set. Absent for every node on the direct path.
+    ///
+    /// A reload may reuse this runtime when the node's own config is unchanged,
+    /// but the detour is configuration of the *generation*, not of the node: a
+    /// front group can name a different member while this runtime survives.
+    /// The binding therefore has to be replaceable, otherwise the reused
+    /// runtime keeps dialling through the previous generation's front.
+    detour: parking_lot::RwLock<Option<Arc<crate::proxy::detour::DetourPath>>>,
     #[cfg(any(feature = "rprx", test))]
     vless_carriers: Arc<tokio::sync::Semaphore>,
 }
@@ -372,6 +388,25 @@ impl NodeRuntime {
             return None;
         }
         crate::proxy::transport::xhttp::XhttpRuntime::new(node)
+    }
+
+    /// Give the node the path it dials through. The generation resolves the
+    /// name once the whole node set is known; rebinding replaces the previous
+    /// generation's path so a reused runtime follows the new front.
+    pub fn bind_detour(&self, path: Arc<crate::proxy::detour::DetourPath>) {
+        *self.detour.write() = Some(path);
+    }
+
+    /// Forget a binding the new generation no longer names. Without this a
+    /// reused runtime whose node dropped its detour would keep riding the old
+    /// one, which is as wrong as keeping a stale member.
+    pub fn clear_detour(&self) {
+        *self.detour.write() = None;
+    }
+
+    /// The node this one dials through, or `None` on the direct path.
+    pub fn detour(&self) -> Option<Arc<crate::proxy::detour::DetourPath>> {
+        self.detour.read().clone()
     }
 
     fn build(
@@ -394,6 +429,7 @@ impl NodeRuntime {
                 #[cfg(feature = "owned-tasks")]
                 task_owner: task_owner.clone(),
                 warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
+                detour: parking_lot::RwLock::new(None),
                 #[cfg(any(feature = "rprx", test))]
                 vless_carriers,
             })
@@ -607,6 +643,9 @@ impl NodeRuntime {
                 ProtocolRuntime::Quic(runtime) => {
                     runtime.client_count().is_none_or(|count| count != 0)
                 }
+                ProtocolRuntime::Masque(runtime) => {
+                    runtime.tunnel_count().is_none_or(|count| count != 0)
+                }
                 _ => true,
             }
     }
@@ -619,6 +658,7 @@ impl NodeRuntime {
             sessions: self.pooled_session_count(),
             clients: match &self.runtime {
                 ProtocolRuntime::Quic(runtime) => runtime.client_count(),
+                ProtocolRuntime::Masque(runtime) => runtime.tunnel_count(),
                 _ => Some(0),
             },
         }
@@ -628,7 +668,10 @@ impl NodeRuntime {
     pub(crate) fn tls_connector_loaded(&self) -> bool {
         match &self.runtime {
             ProtocolRuntime::AnyTls(runtime) => runtime.tls.is_loaded(),
-            ProtocolRuntime::None | ProtocolRuntime::Vless(_) | ProtocolRuntime::Quic(_) => false,
+            ProtocolRuntime::None
+            | ProtocolRuntime::Vless(_)
+            | ProtocolRuntime::Quic(_)
+            | ProtocolRuntime::Masque(_) => false,
         }
     }
 }
@@ -769,6 +812,54 @@ pub type SharedRuntimeRegistry = Arc<parking_lot::RwLock<Arc<OutboundRuntimeRegi
 
 impl OutboundRuntimeRegistry {
     /// Build and validate a registry from the generation's node set.
+    /// Give a node the path it dials through. Returns false when the node is
+    /// unknown to this generation.
+    pub fn bind_detour(
+        &self,
+        node_id: uuid::Uuid,
+        path: Arc<crate::proxy::detour::DetourPath>,
+    ) -> bool {
+        let Some(runtime) = self.nodes.get(&node_id) else {
+            return false;
+        };
+        runtime.bind_detour(path);
+        true
+    }
+
+    /// The path this node rides, for a caller that means to measure the node
+    /// as it dials. A manual delay test has no detour of its own to name.
+    pub fn detour_for(&self, node_id: uuid::Uuid) -> Option<Arc<crate::proxy::detour::DetourPath>> {
+        self.nodes
+            .get(&node_id)
+            .and_then(|runtime| runtime.detour())
+    }
+
+    /// Drop a detour binding the new generation no longer names. A reused
+    /// runtime keeps every other piece of its state, so without this a node
+    /// whose detour was removed would keep riding the previous front.
+    pub fn clear_detour(&self, node_id: uuid::Uuid) -> bool {
+        let Some(runtime) = self.nodes.get(&node_id) else {
+            return false;
+        };
+        runtime.clear_detour();
+        true
+    }
+
+    /// Reclaim MASQUE tunnels a reused runtime kept from a previous generation.
+    ///
+    /// A node whose config did not change keeps its runtime across a reload,
+    /// tunnel map included. Detour bindings are refreshed every generation, so
+    /// a tunnel opened over the old path may no longer have any flow dialling
+    /// it — and with no dial, `tunnel_for` never runs its `retain`, so the
+    /// kernel keeps that TUN device and its route until a restart.
+    pub async fn prune_masque_tunnels(&self) {
+        for runtime in self.nodes.values() {
+            if let ProtocolRuntime::Masque(masque) = &runtime.runtime {
+                masque.prune_idle().await;
+            }
+        }
+    }
+
     pub fn build(nodes: &[Node]) -> Result<Self, RuntimeRegistryError> {
         Self::build_reusing(
             nodes,
@@ -833,6 +924,14 @@ impl OutboundRuntimeRegistry {
     /// configuration. The fork owns fresh protocol sessions and terminal
     /// lifecycle state, while sharing this generation's dial admission and
     /// startup dial/VLESS-carrier ceilings.
+    ///
+    /// The detour bindings are carried over: the fork rebuilds every runtime
+    /// fresh, and a fresh runtime holds no detour, so a node whose config
+    /// names one would refuse every DNS dial with "detour ... is not bound
+    /// in this generation" even though this generation bound it — and the
+    /// fork is rebuilt on every boot, so a restart would not help either.
+    /// The carried path stays pinned to *this* generation, the one that
+    /// resolved the name and owns the target's live runtime.
     pub fn fork_for_dns(&self) -> Result<Self, RuntimeRegistryError> {
         let nodes: Vec<Node> = self
             .nodes
@@ -850,6 +949,13 @@ impl OutboundRuntimeRegistry {
             None,
         )?;
         fork.dial_semaphore = Arc::clone(&self.dial_semaphore);
+        for (id, runtime) in &self.nodes {
+            if let Some(detour) = runtime.detour()
+                && let Some(fork_runtime) = fork.nodes.get(id)
+            {
+                fork_runtime.bind_detour(detour);
+            }
+        }
         Ok(fork)
     }
 

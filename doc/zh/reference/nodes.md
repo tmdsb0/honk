@@ -70,11 +70,9 @@ protocol|host|port|credential-fingerprint|dial-shape
 
 XHTTP 身份还包含有效的 TLS/明文安全配置，以及全部已接受的规范 XHTTP 参数，包括标头、填充和 POST 间隔。输入别名、标头名称大小写与等价范围表示会在派生前规范化。新增 XHTTP 不改变已有 TCP/WS/gRPC 身份材料。
 
-WebSocket 的非空规范标头 map 也参与身份派生。标头名称大小写、插入顺序与等值别名不改变身份，值不同则改变身份；省略或空 map 保留原有身份。
-
 拼接前，每个原始凭据字段、拨号形态字段和有效的 `host` 值都会将 `\` 转义为 `\\`，将 `|` 转义为 `\|`。拼接后的指纹不再转义。对于通过 `Config::validate` 的节点，不同的身份字段会产生不同的哈希输入。完整配置校验拒绝的节点不在此保证范围内，即使 `Node::from_share_link` 能为其派生 ID。
 
-**破坏性升级：**所有成功重新派生身份的 VLESS 节点都会获得新 ID，包括从未填写 `vless_mode`、关闭 UDP 或设置 ALPN 的节点。以 ID 为键的健康、预热及会话状态会重新建立。在该次迁移中，其他协议仅在上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 时变更 ID；ALPN 使用独立的 JSON 子 UUID 步骤，仅 ALPN 含有这些字符不触发该变化。
+**破坏性升级：**所有成功重新派生身份的 VLESS 节点都会获得新 ID，包括从未填写 `vless_mode`、关闭 UDP 或设置 ALPN 的节点。以 ID 为键的健康、预热及会话状态会重新建立。其他协议仅在上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 时变更 ID；ALPN 使用独立的 JSON 子 UUID 步骤，仅 ALPN 含有这些字符不触发该变化。
 
 **逐包带地址的 UDP 分帧：**有效 UDP 路径在 53、443 或 54 端口使用 UoT v2 或 H2MUX 的 VLESS 节点，会再次获得新 ID。这包括 `packetEncoding=uot-v2`、`mux=h2mux`，以及到达这两条路径的池回退，因为这些路径现在逐包携带地址。
 
@@ -123,7 +121,6 @@ Node 模型包含下列字段。分享链接从协议方案、用户信息、地
 | `flow` | string? | null | VLESS `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`；Shadowrocket `xtls=2` 选择基础 flow |
 | `network` | string? | null | 受支持协议的数据包网络能力；与 VMess JSON `net` 等流传输字段独立 |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` 与 Host 标头 |
-| `ws_headers` | object | `{}`；输出时省略空 map | 附加升级标头的 string map，名称规范化为小写；等值别名合并，冲突别名拒绝。最多 64 项、名称与值合计 16 KiB；控制字节拒绝。保留名称：`host`、`connection`、`upgrade`、`sec-websocket-key`、`sec-websocket-version`、`sec-websocket-extensions`、`sec-websocket-accept`、`sec-websocket-protocol`、`content-length`、`transfer-encoding`。非 WebSocket 流传输携带非空 map 会被拒绝；没有流传输的协议会丢弃该字段。null 无效。只有订阅与结构化输入能提供标头，任何分享链接方言都不携带它们。 |
 | `grpc_service` | string? | null | gRPC `serviceName` 或 `service_name` |
 | `xhttp` | object? | 省略 | flat 结构化输入/输出中的规范 XHTTP 参数；其他传输携带该对象会被拒绝 |
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 认证与 salamander 密码 |
@@ -218,7 +215,7 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 | --- | --- | --- | --- | --- |
 | `ss` | `shadowsocks` | 是 | 是 | AEAD 与 Shadowsocks 2022 |
 | `trojan` | — | 是 | 是* | TLS；TCP/WS/gRPC/XHTTP 传输 |
-| `vmess` | — | 是 | 否 | AEAD；TCP/WS/gRPC/XHTTP 与 REALITY；handler 需要 `rprx` |
+| `vmess` | — | 是 | 是* | AEAD；TCP/WS/gRPC/XHTTP 与 REALITY；command-UDP 为连接式，每个目标一条关联；handler 需要 `rprx` |
 | `vless` | — | 是 | 可配置* | 原生 UDP、UoT v2、H2MUX、XUDP、Mux.Cool、Encryption、REALITY 与 Vision；handler 需要 `rprx` |
 | `socks5` | — | 是 | 是 | CONNECT 与 UDP ASSOCIATE |
 | `hysteria2` | — | 是 | 是 | QUIC/H3、salamander、brutal/BBR 与端口跳跃 |
@@ -228,7 +225,7 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 | `direct` | — | 是 | 是 | 保留的内置直连出站；没有分享链接协议方案 |
 | `block` | — | 否 | 否 | 保留的内置拒绝出站；没有分享链接协议方案 |
 
-`network` 可独立于流传输方式关闭 Trojan、AnyTLS 和 VLESS 的数据包拨号。VMess UDP 尚未实现。
+`network` 可独立于流传输方式关闭 Trojan、VMess、AnyTLS 和 VLESS 的数据包拨号。VMess UDP 使用协议的 `RequestCommandUDP`（命令字节 `0x02`）：AEAD 请求头指定唯一目的地，每个 body chunk 承载一个数据报，因此一条关联只服务一个目标。它是连接式 UDP，不是共享的全锥形源。
 
 | 协议 | UDP 行为 |
 | --- | --- |
@@ -243,7 +240,7 @@ SOCKS5 UDP ASSOCIATE 为每个客户端源保持一条控制 TCP 连接和一个
 - Trojan、AnyTLS；
 - VLESS XUDP/Mux.Cool、UoT v2、H2MUX。
 
-VLESS 原生 UDP 是例外，其流只指定一个目标。这包括显式 `native`，以及未启用 Vision 时 UDP/53 和 UDP/443 上的 `auto`。
+VLESS 原生 UDP 与 VMess command-UDP 是例外：它们的流只指定一个目标，回复不能携带任意对端，因此不是全锥形。VLESS 对应显式 `native`，以及未启用 Vision 时 UDP/53 和 UDP/443 上的 `auto`；VMess 则完全没有共享的多目标载体。
 
 来自此前未联系过的对端的回复，会保留该对端的源地址。这实现了 RFC 5780 全锥形的客户端部分。服务端还须为每条关联使用一个未连接套接字，并转发任意对端的回复。honk 无法绕过服务端过滤；`direct` 流量遵循宿主机自身的 NAT。限制如下：
 
@@ -256,7 +253,7 @@ VLESS 原生 UDP 是例外，其流只指定一个目标。这包括显式 `nati
 - 53 端口的流不在数据路径中发布客户端回复 framing，因此对 53 端口流的主动回复依赖宿主机转发。
 - 所有客户端源共用一个进程级外来回复套接字池，每个对端地址使用一个套接字。上限按端点容量计算，每个端点对应七个套接字。达到上限后，新外来对端会淘汰最久未使用的套接字。清理任务关闭超过一个 NAT 超时时间未使用的套接字。
 - 一个源最近关闭的 64 个目的地的回复会被丢弃，不作为外来回复投递。这包括连接关闭和不可用节点清理。重新绑定会将目的地移出列表；第 65 次关闭会移除最早的记录。空闲超时和传输错误不会加入记录，因此只要源仍存在，这些对端仍可发送外来回复。仍绑定的流不受影响。
-- VMess 没有 UDP 后端。
+- VMess command-UDP 每个目的地保留一条关联。它拒绝超过 16,366 字节的数据报（单个 AEAD chunk），也不会报告外来回复源地址。
 
 对于支持 `network` 的协议，扁平结构化输入接受逗号分隔的 `tcp`/`udp`，忽略各项首尾空白和 ASCII 大小写。`tcp` 关闭 UDP；`udp` 与 `tcp,udp` 都允许 UDP。空文本或纯空白规范化为未指定，保留协议的默认能力。`quic` 等未知值，或非空列表中的空项，会使节点被拒绝。该字段只控制 UDP 准入；`udp` 不会额外禁止 TCP。
 
@@ -297,7 +294,7 @@ Shadowsocks UDP（传统 AEAD 与 2022）为每个客户端源的所有目的地
 | 值 | 传输方式 | 字段映射 |
 | --- | --- | --- |
 | 空文本或 `tcp` | 裸 TCP | — |
-| `ws` | WebSocket | `path` → `ws_path`；`host` → `ws_host`；升级标头没有分享链接字段 |
+| `ws` | WebSocket | `path` → `ws_path`；`host` → `ws_host` |
 | `grpc` | gRPC | `serviceName` 或 `service_name` → `grpc_service` |
 | `xhttp` 或输入别名 `splithttp` | XHTTP | 见下文的 H2 兼容范围。 |
 
@@ -314,7 +311,7 @@ node {
 
 VMess 接受 v2rayN Base64 JSON（`net`、`host`、`path`、`sni`），也接受 Shadowrocket 的 `vmess://base64(auto:UUID@host:port)?...` 地址部分形式。后者映射 `tls`、`peer`/`sni`、`obfs=websocket|grpc`、`obfsParam`、`path` 和 `remark`；接受 standard / URL-safe Base64，有无填充均可。编码地址部分的 VMess 要求 AEAD 认证及 `auto`/`aes-128-gcm`；不支持的加密方式和 REALITY 参数会被拒绝，不会静默替换。
 
-VMess JSON 的 `net` 和 Shadowrocket 传输参数只选择流传输方式，不再写入数据包网络能力字段。未指定数据包限制时，对有 UDP 后端的协议保留原有默认 UDP 能力（VMess 没有 UDP 后端）；已有的有效空传输字段也保留原始写法。非 XHTTP 传输保留对无关导出字段 `mode`、`extra` 的旧有忽略行为；这些字段不会选择 XHTTP。显式冲突的传输声明仍会拒绝节点。
+VMess JSON 的 `net` 和 Shadowrocket 传输参数只选择流传输方式，不再写入数据包网络能力字段。未指定数据包限制时，对有 UDP 后端的协议保留默认 UDP 能力（包含 VMess command-UDP）；已有的有效空传输字段也保留原始写法。非 XHTTP 传输保留对无关导出字段 `mode`、`extra` 的旧有忽略行为；这些字段不会选择 XHTTP。显式冲突的传输声明仍会拒绝节点。
 
 VLESS 支持 TCP+REALITY+Vision、TCP+REALITY、TCP+WS、TCP+WS+TLS、TCP+gRPC 与下述 H2 XHTTP 配置方案。未加密 Vision 的 direct-copy 要求使用 TLS 1.3 或 REALITY 的裸 TCP，不能使用 WS/gRPC/XHTTP；加密 Vision 遵循下文的组合规则。
 
@@ -656,9 +653,18 @@ REALITY 不使用 CA 校验或 `skip_cert_verify`。目标 TLS 记录的缓冲�
 
 静态配置会提供真实 ECH，ECH 被拒绝时握手 fail-closed。发现是尽力而为且 fail-open：找不到 ECHConfigList 时，握手不带真实 ECH 继续；`utls` 仍发送 ECH GREASE。发现使用 bootstrap resolver，未配置时使用系统首个 nameserver，并按域名缓存结果。同一组控制项也适用于 QUIC 协议。
 
+## 链式代理与 MASQUE 节点
+
+节点可以在分享链接里用 `?dialer-proxy=front`（也接受 `dialer_proxy`、`detour`、`underlying-proxy`、`underlying_proxy`）指定拨号前置；Clash / Mihomo 订阅读 `dialer-proxy`，sing-box JSON 读 `detour`。前置可为节点名或组名，在每次重载时重新绑定，前置组换成员即时生效。节点级 detour 在 TCP 与 UDP 上都生效。
+
+`masque://host:port` 形式的手写链接会被识别为 MASQUE（connect-ip）出站，但 WARP 所需的密钥等字段请经订阅 YAML 的 `type: masque` 条目提供（`private-key`、`public-key`、`network`、`ip` / `ipv6`、`mtu`、`remote-dns-resolve` 等）。MASQUE 在本机创建 TUN 设备，每条承载路径各持有一个隧道。节点级 detour 指向另一个 MASQUE 节点会被忽略并告警。
+
+组级 `detour:`、引用组继承、协议支持范围与完整配置示例见[链式代理与 MASQUE 配置指南](../guide/chained-proxy-and-masque.md)。
+
 ## 分享链接 scheme
 
 | Scheme | 格式与映射 |
+| `masque://` | MASQUE connect-ip 端点；密钥等字段由订阅 YAML 提供，见上一节 |
 | --- | --- |
 | `ss://` | SIP002 userinfo/完整地址部分 base64 形式，以及 `plugin` |
 | `vmess://` | 宽松 base64 v2rayN JSON（`add`、`port`、`id`、`scy`、`net`、`host`、`path`、`tls`、`sni`、`ps`） |
@@ -675,5 +681,6 @@ REALITY 不使用 CA 校验或 `skip_cert_verify`。目标 TLS 记录的缓冲�
 ## 相关文档
 
 - [订阅参考](./subscription.md)
+- [链式代理与 MASQUE 配置指南](../guide/chained-proxy-and-masque.md)
 - [组参考](./groups.md)
 - [出站设计](../design/outbound.md)
